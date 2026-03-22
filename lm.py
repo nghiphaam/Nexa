@@ -78,7 +78,7 @@ def configure_tf32_runtime():
 # TOKENIZER
 # ---------------------------------------------------------------------------
 
-DEFAULT_VOCAB_SIZE = 50257
+DEFAULT_VOCAB_SIZE = 50261
 
 EOS_TOKEN = "<|endoftext|>"
 PAD_TOKEN = "<|pad|>"
@@ -93,48 +93,52 @@ AST_TOKEN = "<|assistant|>"
 
 class NexaTokenizer:
     """Wraps tiktoken BPE to match HuggingFace tokenizers interface.
-
-    Special token mapping (reuse unused high-range IDs):
-      50256 = EOS
-      50255 = PAD
-      50254 = SYS
-      50253 = USR
-      50252 = AST
+    Expanded vocab to 50,261 to avoid collisions with GPT-2 merges.
     """
 
     def __init__(self):
         import tiktoken
+        import re
 
         self.enc = tiktoken.get_encoding("gpt2")
-        self._vocab_size = self.enc.n_vocab  # 50257
+        self._base_vocab_size = self.enc.n_vocab  # 50257
+        self._vocab_size = 50261
         self._eos_id = self.enc.eot_token  # 50256
-        self.supports_special_role_tokens = False
+        self.supports_special_role_tokens = True
 
         self.special_map = {
             EOS_TOKEN: 50256,
-            PAD_TOKEN: 50255,
-            SYS_TOKEN: 50254,
-            USR_TOKEN: 50253,
-            AST_TOKEN: 50252,
+            PAD_TOKEN: 50257,
+            SYS_TOKEN: 50258,
+            USR_TOKEN: 50259,
+            AST_TOKEN: 50260,
         }
         self.id_to_special = {v: k for k, v in self.special_map.items()}
+
+        # Regex for splitting by special tokens to handle them correctly during encoding
+        pattern = "|".join(re.escape(k) for k in self.special_map.keys())
+        self.special_pattern = re.compile(f"({pattern})")
 
     def get_vocab_size(self):
         return self._vocab_size
 
     def token_to_id(self, token):
-        return self.special_map.get(token, self._eos_id)
+        if token in self.special_map:
+            return self.special_map[token]
+        raise ValueError(f"Unknown token: {token}")
 
     def encode(self, text):
-        ids = self.enc.encode_ordinary(text)
+        parts = self.special_pattern.split(text)
+        ids = []
+        for p in parts:
+            if p in self.special_map:
+                ids.append(self.special_map[p])
+            elif p:
+                ids.extend(self.enc.encode_ordinary(p))
         return type("E", (), {"ids": ids})()
 
     def encode_batch(self, texts):
-        return [
-            type("E", (), {"ids": self.enc.encode_ordinary(t)})()
-            for t in texts
-            if t and t.strip()
-        ]
+        return [self.encode(t) for t in texts if t and t.strip()]
 
     def decode(self, ids, skip_special_tokens=True):
         result = []
@@ -146,7 +150,7 @@ class NexaTokenizer:
                     buf = []
                 if not skip_special_tokens:
                     result.append(self.id_to_special[i])
-            elif i < self._vocab_size:
+            elif i < self._base_vocab_size:
                 buf.append(i)
         if buf:
             result.append(self.enc.decode(buf))
@@ -160,13 +164,13 @@ def load_tokenizer():
     """Load tokenizer — Nexa default."""
     global _cached_tokenizer
     if "nexa" not in _cached_tokenizer:
-        print("Tokenizer: Nexa BPE (vocab=50,257)")
+        print("Tokenizer: Nexa BPE (vocab=50,261)")
         _cached_tokenizer["nexa"] = NexaTokenizer()
     return _cached_tokenizer["nexa"]
 
 
 def get_vocab_size():
-    return 50257
+    return 50261
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +187,7 @@ class Config:
     vocab_size: int = DEFAULT_VOCAB_SIZE
     eos_id: int = None
     block_size: int = 384
-    sliding_window: int = 512  # 512 for T4, None = full context (unbounded KV cache)
+    sliding_window: int = 384  # Match block_size to prevent drift
     n_embd: int = 1792
     n_head: int = 16  # 1792 / 16 = 112 head_dim
     n_kv_head: int = 4  # GQA ratio = 4:1
@@ -213,11 +217,11 @@ class Config:
     min_p: float = 0.05
     repetition_penalty: float = 1.1
     num_samples: int = 3
-    reasoning_loss_weight: float = 0.1
-    critic_score_loss_weight: float = 0.03
+    reasoning_loss_weight: float = 0.0
+    critic_score_loss_weight: float = 0.0
     critic_rank_loss_weight: float = 1.0
     n_global_tokens: int = 16
-    memory_state_scale: float = 0.08
+    memory_state_scale: float = 0.0  # Overkill for scratch pre-train
     memory_train_dropout: float = 0.3
     speculative_disable_steps: int = 16
 
@@ -388,6 +392,12 @@ class KVCache:
     def rollback(self, n_tokens):
         if n_tokens <= 0:
             return
+        old_write_seq = self.write_seq
+        # Only rollback pos for tokens that were in the tail (past n_global_tokens)
+        n_tail_back = max(
+            0, old_write_seq - max(self.n_global_tokens, old_write_seq - n_tokens)
+        )
+
         self.committed_seq = max(-1, self.committed_seq - n_tokens)
         self.write_seq = self.committed_seq + 1
         # CLEANUP: invalidate dirty slots > committed_seq
@@ -397,6 +407,12 @@ class KVCache:
             self.k_cache.index_fill_(2, dirty_idx, 0)
             self.v_cache.index_fill_(2, dirty_idx, 0)
         self.slot_seq[dirty_mask] = -1
+
+        # Rollback pos correctly for circular buffer
+        if n_tail_back > 0:
+            tail_capacity = max(1, self.max_len - self.n_global_tokens)
+            self.pos = (self.pos - n_tail_back) % tail_capacity
+
         # recompute filled from cleaned slot_seq
         valid = self.slot_seq >= 0
         self.filled = int(valid[0].sum().item())
@@ -678,11 +694,20 @@ class NexaModel(nn.Module):
                 x, _ = block(x, freqs_cos, freqs_sin, None)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
-        critic_x = self.critic_adapter(x.detach())
-        critic_logits = self.critic_head(critic_x)
-        critic_score = torch.sigmoid(self.critic_score_head(critic_x[:, -1, :]))
+
+        # Optimize: skip critic heads entirely if not needed
+        need_critic = reasoning_targets is not None or critic_labels is not None or (return_aux and reasoning_targets is not None)
+        critic_logits = None
+        critic_score = None
+        aux = {}
+
+        if need_critic:
+            critic_x = self.critic_adapter(x.detach())
+            critic_logits = self.critic_head(critic_x)
+            critic_score = torch.sigmoid(self.critic_score_head(critic_x[:, -1, :]))
+            aux["critic_score"] = critic_score.detach()
+
         loss = None
-        aux = {"critic_score": critic_score.detach()}
         if targets is not None:
             lm_loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100
@@ -697,7 +722,7 @@ class NexaModel(nn.Module):
                 )
                 loss = (
                     loss
-                    + getattr(self.config, "reasoning_loss_weight", 0.2)
+                    + getattr(self.config, "reasoning_loss_weight", 0.1)
                     * reasoning_loss
                 )
                 aux["reasoning_loss"] = reasoning_loss.detach()
@@ -708,10 +733,10 @@ class NexaModel(nn.Module):
             )
             loss = (
                 critic_score_loss
-                * getattr(self.config, "critic_score_loss_weight", 0.1)
+                * getattr(self.config, "critic_score_loss_weight", 0.03)
                 if loss is None
                 else loss
-                + getattr(self.config, "critic_score_loss_weight", 0.1)
+                + getattr(self.config, "critic_score_loss_weight", 0.03)
                 * critic_score_loss
             )
             aux["critic_score_loss"] = critic_score_loss.detach()
@@ -2074,10 +2099,16 @@ def main():
         dtype_str = "bfloat16"
         vram_gb = 0
         args.compile = False
-    else:
+    elif cuda_works:
         device_str = "cuda"
         vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
         dtype_str = "bfloat16" if torch.cuda.is_bf16_supported() else "float16"
+    else:
+        device_str = "cpu"
+        dtype_str = "float32"
+        vram_gb = 0
+        args.compile = False
+        args.batch_size = min(args.batch_size, 8)
 
     if args.dtype != "auto":
         dtype_map = {"fp16": "float16", "bf16": "bfloat16", "fp32": "float32"}

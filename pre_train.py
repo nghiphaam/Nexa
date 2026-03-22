@@ -14,6 +14,10 @@ HF_TOKEN = os.environ.get("HF_TOKEN", "")
 DATASET_MANIFEST = "dataset_manifest.json"
 DATASET_SNAPSHOT_DIRNAME = "dataset_snapshot"
 EOS_TOKEN = "<|endoftext|>"
+PAD_TOKEN = "<|pad|>"
+SYS_TOKEN = "<|system|>"
+USR_TOKEN = "<|user|>"
+AST_TOKEN = "<|assistant|>"
 
 
 def ensure_pkg(name, pip_name=None):
@@ -34,29 +38,44 @@ ensure_pkg("tiktoken")
 class NexaTokenizer:
     def __init__(self):
         import tiktoken
+        import re
 
         self.enc = tiktoken.get_encoding("gpt2")  # Using GPT-2 BPE compatible encoding
-        self._vocab_size = self.enc.n_vocab
-        self._eos_id = self.enc.eot_token
+        self._base_vocab_size = self.enc.n_vocab  # 50257
+        self._vocab_size = 50261
+        self._eos_id = self.enc.eot_token  # 50256
+
+        self.special_map = {
+            EOS_TOKEN: 50256,
+            PAD_TOKEN: 50257,
+            SYS_TOKEN: 50258,
+            USR_TOKEN: 50259,
+            AST_TOKEN: 50260,
+        }
+        self.id_to_special = {v: k for k, v in self.special_map.items()}
+        pattern = "|".join(re.escape(k) for k in self.special_map.keys())
+        self.special_pattern = re.compile(f"({pattern})")
 
     def get_vocab_size(self):
         return self._vocab_size
 
     def token_to_id(self, token):
-        if token == EOS_TOKEN:
-            return self._eos_id
-        return self._eos_id
+        if token in self.special_map:
+            return self.special_map[token]
+        raise ValueError(f"Unknown token: {token}")
 
     def encode(self, text):
-        ids = self.enc.encode_ordinary(text)
+        parts = self.special_pattern.split(text)
+        ids = []
+        for p in parts:
+            if p in self.special_map:
+                ids.append(self.special_map[p])
+            elif p:
+                ids.extend(self.enc.encode_ordinary(p))
         return type("E", (), {"ids": ids})()
 
     def encode_batch(self, texts):
-        return [
-            type("E", (), {"ids": self.enc.encode_ordinary(t)})()
-            for t in texts
-            if t and t.strip()
-        ]
+        return [self.encode(t) for t in texts if t and t.strip()]
 
 
 def _hf_login():
