@@ -101,6 +101,19 @@ python chat.py --checkpoint checkpoints/best.pt --cli
 python chat.py --checkpoint checkpoints/best.pt
 ```
 
+**Docker WebUI Mode (Full Stack):**
+Nexa now supports a full-stack WebUI using Open WebUI and Docker. This setup includes:
+- **Nexa API:** An OpenAI-compatible API server running Nexa.
+- **Open WebUI:** A feature-rich interface for interacting with the model.
+- **Cloudflared:** (Optional) For secure remote access via Cloudflare Tunnels.
+
+To launch the stack:
+```bash
+cd Nexa
+docker-compose up -d
+```
+The interface will be available at `http://localhost:3000`.
+
 ---
 
 ## 📝 Design Philosophy & Notes
