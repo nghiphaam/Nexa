@@ -54,3 +54,9 @@ logs/
 # -------------------
 tmp/
 temp/
+
+# -------------------
+# Notebooks
+# -------------------
+*.ipynb
+.ipynb_checkpoints/
