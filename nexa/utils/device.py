@@ -7,10 +7,12 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 try:
     import torch_xla
     import torch_xla.core.xla_model as xm
+    import torch_xla.runtime as xr
     _HAS_XLA = True
 except Exception:
     torch_xla = None
     xm = None
+    xr = None
     _HAS_XLA = False
 
 
@@ -25,7 +27,7 @@ def get_tpu_count():
     if not _HAS_XLA:
         return 0
     try:
-        return xm.xrt_world_size()
+        return xr.world_size()
     except Exception:
         return 0
 
@@ -85,7 +87,7 @@ def setup_distributed_xla():
         raise RuntimeError("torch_xla is not available")
     device = xm.xla_device()
     local_rank = xm.get_local_ordinal()
-    world_size = xm.xrt_world_size()
+    world_size = xr.world_size()
     return local_rank, world_size, device
 
 
@@ -135,7 +137,7 @@ def get_world_size():
     if is_distributed():
         return torch.distributed.get_world_size()
     elif _HAS_XLA:
-        return xm.xrt_world_size()
+        return xr.world_size()
     return 1
 
 
