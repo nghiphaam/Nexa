@@ -75,7 +75,14 @@ class NexaTokenizer:
         return type("E", (), {"ids": ids})()
 
     def encode_batch(self, texts):
-        return [self.encode(t) for t in texts if t and t.strip()]
+        # Keep alignment by returning None for empty texts instead of dropping
+        results = []
+        for t in texts:
+            if t and t.strip():
+                results.append(self.encode(t))
+            else:
+                results.append(None)  # Placeholder to maintain alignment
+        return results
 
 
 def _hf_login():
@@ -284,10 +291,15 @@ def tokenize_dataset_in_memory(
             for i in range(0, len(ds), chunk_size):
                 texts = ds[i : i + chunk_size]["text"]
                 encodings = tokenizer.encode_batch(texts)
-                total_len = sum(len(enc.ids) + 1 for enc in encodings)
+                # FIX #4: Handle None encodings from empty texts
+                total_len = sum(len(enc.ids) + 1 for enc in encodings if enc is not None)
+                if total_len == 0:
+                    continue
                 chunk = np.empty(total_len, dtype=np_dtype)
                 pos = 0
                 for enc in encodings:
+                    if enc is None:
+                        continue
                     tok_len = len(enc.ids)
                     chunk[pos : pos + tok_len] = enc.ids
                     chunk[pos + tok_len] = eos_id

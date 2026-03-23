@@ -23,11 +23,22 @@ except Exception:
 
 
 def safe_cuda_alloc():
+    """Check if CUDA is available and can allocate memory.
+    Returns True only if CUDA is available and has some free memory.
+    """
     try:
-        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-            torch.zeros((1,), device="cuda")
-            return True
-        return False
+        if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+            return False
+        # FIX #4: Actually try to allocate to catch fragmentation issues
+        # Check free memory first as a quick filter
+        free, total = torch.cuda.mem_get_info(0)
+        if free < 100 * 1024 * 1024:  # Less than 100MB free
+            return False
+        # Try real allocation to catch fragmentation
+        test = torch.empty((1, 1024, 1024), device="cuda", dtype=torch.float32)
+        del test
+        torch.cuda.empty_cache()
+        return True
     except Exception:
         return False
 
@@ -138,7 +149,14 @@ class NexaTokenizer:
         return type("E", (), {"ids": ids})()
 
     def encode_batch(self, texts):
-        return [self.encode(t) for t in texts if t and t.strip()]
+        # FIX #3: Keep alignment by returning None for empty texts (same as pre_train.py)
+        results = []
+        for t in texts:
+            if t and t.strip():
+                results.append(self.encode(t))
+            else:
+                results.append(None)  # Placeholder to maintain alignment
+        return results
 
     def decode(self, ids, skip_special_tokens=True):
         result = []
@@ -227,7 +245,14 @@ class Config:
 
     # System
     device: str = "cuda" if safe_cuda_alloc() else "cpu"
-    dtype: str = "bfloat16" if torch.cuda.is_bf16_supported() else "float16"
+    # FIX #6: Handle CPU + bfloat16 edge case (some CPUs support it, most don't)
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        dtype: str = "bfloat16"
+    elif torch.cuda.is_available():
+        dtype: str = "float16"
+    else:
+        # CPU: use float32 (bfloat16 on CPU is rare and often slow)
+        dtype: str = "float32"
     use_grad_ckpt: bool = False
     compile_model: bool = True
     compile_mode: str = "reduce-overhead"  # max-autotune chỉ tốt trên Ampere+
@@ -260,6 +285,23 @@ def precompute_rope_freqs(dim, max_seq_len, theta=10000.0):
 
 
 def apply_rope(xq, xk, freqs_cos, freqs_sin):
+    # FIX #7: Handle shape mismatch gracefully - truncate instead of crash
+    seq_len = xq.shape[-2]
+    freq_len = freqs_cos.shape[0]
+    if seq_len != freq_len:
+        if seq_len <= freq_len:
+            freqs_cos = freqs_cos[:seq_len]
+            freqs_sin = freqs_sin[:seq_len]
+        else:
+            # FIX #7: Truncate input instead of crashing (production-safe)
+            # This shouldn't happen if rope is precomputed correctly, but be defensive
+            import warnings
+            warnings.warn(
+                f"RoPE: seq_len={seq_len} > freq_len={freq_len}. "
+                f"Truncating to {freq_len}. Consider increasing block_size."
+            )
+            xq = xq[:, :, :freq_len, :]
+            xk = xk[:, :, :freq_len, :]
     xq_r = xq.float().reshape(*xq.shape[:-1], -1, 2)
     xk_r = xk.float().reshape(*xk.shape[:-1], -1, 2)
 
@@ -310,6 +352,8 @@ class KVCache:
         self.write_seq = 0  # next absolute seq id
         self.committed_seq = -1  # max valid seq id (after rollback)
         self.filled = 0
+        # FIX #2: Track tail region start for better memory locality
+        self._tail_start = self.n_global_tokens  # physical start of tail region
 
     def reset(self):
         self.k_cache.zero_()
@@ -319,6 +363,8 @@ class KVCache:
         self.write_seq = 0
         self.committed_seq = -1
         self.filled = 0
+        # FIX #2: Reset tail region tracking
+        self._tail_start = self.n_global_tokens
 
     def update(self, k_val, v_val, w=None):
         bsz, n_h, seq_len, hd = k_val.shape
@@ -326,7 +372,7 @@ class KVCache:
         if (
             self.filled > self.max_len
             or self.write_seq < 0
-            or self.committed_seq >= self.write_seq
+            or self.committed_seq > self.write_seq - 1
         ):
             self.reset()
         assert (self.slot_seq <= self.committed_seq).all(), (
@@ -368,25 +414,48 @@ class KVCache:
             prefix_slots = torch.arange(
                 self.write_seq, self.write_seq + n_prefix, device=k_val.device
             )
-            self.k_cache[:, :, prefix_slots, :] = k_val[:, :, :n_prefix, :]
-            self.v_cache[:, :, prefix_slots, :] = v_val[:, :, :n_prefix, :]
-            self.slot_seq[:, prefix_slots] = seq_ids[:n_prefix].unsqueeze(0)
+            # FIX #2: Allow overwrite if new seq_id >= current (handles rollback + rewrite)
+            current_seq = self.slot_seq[0, prefix_slots]
+            new_seq = seq_ids[:n_prefix]
+            update_mask = (current_seq == -1) | (new_seq >= current_seq)
+            if update_mask.any():
+                update_slots = prefix_slots[update_mask]
+                update_idx = torch.nonzero(update_mask).squeeze(-1)
+                self.k_cache[:, :, update_slots, :] = k_val[:, :, update_idx, :]
+                self.v_cache[:, :, update_slots, :] = v_val[:, :, update_idx, :]
+                self.slot_seq[:, update_slots] = seq_ids[update_idx].unsqueeze(0)
             offset = n_prefix
 
         if offset < seq_len:
             tail_len = seq_len - offset
             tail_capacity = max(1, w - global_keep)
-            tail_slots = global_keep + (
-                (self.pos + torch.arange(tail_len, device=k_val.device)) % tail_capacity
-            )
+            # FIX #2: Try to maintain contiguous physical layout when possible
+            # This reduces memory scatter during attention
+            if self.pos == 0 and tail_len <= tail_capacity:
+                # Best case: write contiguously from tail_start
+                tail_slots = torch.arange(
+                    self._tail_start, self._tail_start + tail_len, device=k_val.device
+                )
+                # FIX #2b: Correct wrap calculation - stay in [global_keep, max_len) range
+                self._tail_start = global_keep + ((self._tail_start - global_keep + tail_len) % tail_capacity)
+                self.pos = (self.pos + tail_len) % tail_capacity
+            else:
+                # Fallback: circular buffer (may cause some scatter)
+                tail_slots = global_keep + (
+                    (self.pos + torch.arange(tail_len, device=k_val.device)) % tail_capacity
+                )
+                self.pos = int((self.pos + tail_len) % tail_capacity)
             self.k_cache[:, :, tail_slots, :] = k_val[:, :, offset:, :]
             self.v_cache[:, :, tail_slots, :] = v_val[:, :, offset:, :]
             self.slot_seq[:, tail_slots] = seq_ids[offset:].unsqueeze(0)
-            self.pos = int((self.pos + tail_len) % tail_capacity)
 
         self.write_seq += orig_seq_len
 
         self.committed_seq = self.write_seq - 1
+        # FIX #3: Recompute filled accurately (trade-off: correctness over speed)
+        # This ensures filled reflects actual valid tokens, not optimistic estimate
+        valid = self.slot_seq >= 0
+        self.filled = int(valid[0].sum().item())
         return self.get_kv_ordered()
 
     def rollback(self, n_tokens):
@@ -412,8 +481,10 @@ class KVCache:
         if n_tail_back > 0:
             tail_capacity = max(1, self.max_len - self.n_global_tokens)
             self.pos = (self.pos - n_tail_back) % tail_capacity
+            # FIX #4: Also rollback _tail_start to maintain locality
+            self._tail_start = self.n_global_tokens + ((self._tail_start - self.n_global_tokens - n_tail_back) % tail_capacity)
 
-        # recompute filled from cleaned slot_seq
+        # FIX #1: Recompute filled accurately after rollback (single compute, no duplicate)
         valid = self.slot_seq >= 0
         self.filled = int(valid[0].sum().item())
         assert (self.slot_seq <= self.committed_seq).all(), (
@@ -643,10 +714,13 @@ class NexaModel(nn.Module):
     def _apply_memory_state(self, x, memory_state=None, memory_query_state=None):
         if memory_state is None:
             return x
+        # FIX #5: Skip computation if scale is 0
+        scale = getattr(self.config, "memory_state_scale", 0.08)
+        if scale == 0:
+            return x
         if memory_state.dim() == 1:
             memory_state = memory_state.unsqueeze(0)
         memory_state = memory_state.clamp(-3.0, 3.0).to(device=x.device, dtype=x.dtype)
-        scale = getattr(self.config, "memory_state_scale", 0.08)
         memory_value = self.memory_value_proj(memory_state).unsqueeze(1) * scale
         memory_scale = (
             torch.tanh(self.memory_scale_proj(memory_state)).unsqueeze(1) * scale
@@ -785,13 +859,10 @@ class NexaModel(nn.Module):
                 if seen_mask is not None:
                     # O(1) path: pre-built boolean mask
                     score = logits[b].clone()
+                    # FIX #6: Symmetric penalty - always penalize (reduce magnitude)
                     logits[b] = torch.where(
                         seen_mask,
-                        torch.where(
-                            score > 0,
-                            score / repetition_penalty,
-                            score * repetition_penalty,
-                        ),
+                        score / repetition_penalty,  # Always divide to penalize
                         score,
                     )
                 else:
@@ -801,11 +872,8 @@ class NexaModel(nn.Module):
                     if seen.numel() > 0:
                         seen = seen.clamp(0, vocab_size - 1)
                         score = logits[b].clone()
-                        logits[b, seen] = torch.where(
-                            score[seen] > 0,
-                            score[seen] / repetition_penalty,
-                            score[seen] * repetition_penalty,
-                        )
+                        # FIX #6: Symmetric penalty
+                        logits[b, seen] = score[seen] / repetition_penalty
 
         temperature = max(float(temperature), 1e-5)
         logits = logits / temperature

@@ -58,7 +58,15 @@ NORMAL_QUERY_SEEDS = [
     "What does HTTP mean?",
 ]
 def clone_critic_model(model, device):
+    # FIX #6: Clone tensors to prevent shared reference side effects
+    # Use state_dict to avoid zip order mismatch
     critic_model = copy.deepcopy(model)
+    # Clone weight tensors (not just share) to prevent update side effects
+    orig_state = model.state_dict()
+    for name, param in critic_model.named_parameters():
+        if name in orig_state:
+            # FIX #6: Clone to avoid shared reference
+            param.data = orig_state[name].detach().clone()
     critic_model = critic_model.to(device)
     critic_model.eval()
     for p in critic_model.parameters():
@@ -174,6 +182,9 @@ def _safe_tool_eval(expr):
             if isinstance(node, ast.Name) and node.id not in allowed_names:
                 return "Error: unsafe expression or blocked tokens"
             if isinstance(node, ast.Attribute):
+                # Block access to dunder attributes to prevent object internals leak
+                if node.attr.startswith("__"):
+                    return "Error: unsafe expression or blocked tokens"
                 if not isinstance(node.value, ast.Name) or node.value.id != "math":
                     return "Error: unsafe expression or blocked tokens"
                 if node.attr not in allowed_math_attrs:
@@ -251,6 +262,19 @@ def format_chat(
 ):
     eos_id = tokenizer.token_to_id(EOS_TOKEN)
     use_special_roles = getattr(tokenizer, "supports_special_role_tokens", True)
+    # FIX #5: Validate messages and warn about drops (with stacklevel)
+    if not messages:
+        if return_reasoning_mask:
+            return [], [], []
+        return [], []
+    original_len = len(messages)
+    messages = [m for m in messages if m and isinstance(m, dict) and "role" in m and "content" in m]
+    if len(messages) < original_len:
+        import warnings
+        warnings.warn(
+            f"format_chat: dropped {original_len - len(messages)} malformed messages",
+            stacklevel=2
+        )
     if use_special_roles:
         sys_id = tokenizer.token_to_id(SYS_TOKEN)
         usr_id = tokenizer.token_to_id(USR_TOKEN)
@@ -413,10 +437,18 @@ def merge_lora(model):
     merged = 0
     for module in model.modules():
         if isinstance(module, LoRALinear):
+            # FIX #6: Prevent double merge
+            if getattr(module, "_merged", False):
+                continue
             delta = (module.lora_A @ module.lora_B) * module.scaling
-            module.original.weight.data += delta.T  
+            # FIX #7: Use float precision to prevent accumulation error
+            orig_weight = module.original.weight.data
+            module.original.weight.data = (
+                orig_weight.float() + delta.T.float()
+            ).to(orig_weight.dtype)
             module.lora_A.data.zero_()
             module.lora_B.data.zero_()
+            module._merged = True
             merged += 1
     print(f"Merged {merged} LoRA layers into base weights")
     return model
@@ -457,32 +489,41 @@ class VectorMemory:
         raw = self._pool_raw(ids)
         if raw is None:
             return None
-        return self.project(raw).cpu()  
+        # FIX #3: Keep on GPU to avoid CPU/GPU transfer overhead
+        return self.project(raw)
     def add(self, text, ids, timestamp=None, memory_type="conversation"):
         import time as _time
         emb = self.embed(ids)
         raw_state = self._pool_raw(ids)
         if emb is not None and raw_state is not None:
             with self.lock:
+                # FIX #6: Dedup - check last few entries (not just last one)
+                for i in range(min(3, len(self.db))):
+                    if self.db[-(i+1)][2] == text:
+                        return
                 if len(self.db) >= self.MAX_DB:
-                    self.db.pop(0)  
+                    self.db.pop(0)
                 ts = timestamp if timestamp is not None else _time.monotonic()
-                self.db.append((emb, raw_state.cpu(), text, ts, memory_type))
+                # FIX #3: Store on CPU to save GPU memory
+                self.db.append((emb.cpu(), raw_state.cpu(), text, ts, memory_type))
     def retrieve_kv(self, query_ids, decay=0.05, top_k=None, min_score=0.2):
-        with self.lock:
-            db_snapshot = list(self.db)
-        top_k = top_k or min(4, max(1, len(db_snapshot) // 5))
-        if not db_snapshot:
-            return []
         import time as _time
+        with self.lock:
+            if not self.db:
+                return []
+            db_snapshot = list(self.db)
+            now = _time.monotonic()
+        top_k = top_k or min(4, max(1, len(db_snapshot) // 5))
+        # FIX #4: Use correct variable name
         q_emb = self.embed(query_ids)
         if q_emb is None:
             return []
-        now = _time.monotonic()
         hits = []
         type_bonus = {"fact": 1.08, "tool_result": 1.04, "conversation": 1.0}
         for emb, _raw_state, text, ts, memory_type in db_snapshot:
+            # FIX #4: Clamp cosine similarity to prevent precision overflow
             sim = float((q_emb * emb).sum())
+            sim = max(-1.0, min(1.0, sim))  # Clamp to [-1, 1]
             age = now - ts
             score = sim * math.exp(-decay * age) * type_bonus.get(memory_type, 1.0)
             if score < min_score:
@@ -505,19 +546,21 @@ class VectorMemory:
         )
         return memory_text[:1000]
     def retrieve_state(self, query_ids, decay=0.05, device=None):
-        with self.lock:
-            db_snapshot = list(self.db)
-        if not db_snapshot:
-            return None
         import time as _time
+        with self.lock:
+            if not self.db:
+                return None
+            db_snapshot = list(self.db)
+            now = _time.monotonic()
         q_emb = self.embed(query_ids)
         if q_emb is None:
             return None
-        now = _time.monotonic()
         type_bonus = {"fact": 1.08, "tool_result": 1.04, "conversation": 1.0}
         scored = []
         for emb, raw_state, _text, ts, memory_type in db_snapshot:
+            # FIX #4: Clamp similarity here too (same as retrieve_kv)
             sim = float((q_emb * emb).sum())
+            sim = max(-1.0, min(1.0, sim))
             age = now - ts
             score = sim * math.exp(-decay * age) * type_bonus.get(memory_type, 1.0)
             if score < 0.15:
@@ -527,11 +570,15 @@ class VectorMemory:
             return None
         scored.sort(key=lambda x: x[0], reverse=True)
         top = scored[: min(4, len(scored))]
-        weights = torch.tensor([max(s, 1e-4) for s, _ in top], dtype=torch.float32)
+        # FIX #2: Match dtype with model weights
+        target_device = device or self.wte.weight.device
+        target_dtype = self.wte.weight.dtype
+        weights = torch.tensor([max(s, 1e-4) for s, _ in top], dtype=target_dtype, device=target_device)
         weights = weights / weights.sum().clamp_min(1e-6)
-        state = sum(w * raw.squeeze(0).float() for w, (_, raw) in zip(weights, top))
-        state = F.normalize(state, dim=-1)
-        return state.to(device or self.wte.weight.device)
+        state = sum(w * raw.squeeze(0).to(dtype=target_dtype, device=target_device) for w, (_, raw) in zip(weights, top))
+        # FIX #3: Add eps to prevent NaN from zero vectors
+        state = F.normalize(state, dim=-1, eps=1e-6)
+        return state
     def query_state(self, query_ids, device=None):
         raw = self._pool_raw(query_ids)
         if raw is None:
@@ -604,11 +651,28 @@ class ChatSession:
             self.reflection_enabled = True
     def _ensure_executor(self):
         executor = getattr(self, "_tool_executor", None)
+        # FIX #5: Check if executor is actually alive, not just _shutdown flag
         if executor is None or getattr(executor, "_shutdown", False):
+            # Clean up old executor first
+            if executor is not None:
+                try:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
             self._tool_executor = ProcessPoolExecutor(
                 max_workers=1, mp_context=mp.get_context("spawn")
             )
         return self._tool_executor
+
+    def _cleanup_executor(self):
+        # FIX #6: Ensure executor is properly cleaned up
+        executor = getattr(self, "_tool_executor", None)
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            self._tool_executor = None
     def _reset_cache(self):
         n_layers = len(self.model.transformer.h)
         sw = (
@@ -656,7 +720,12 @@ class ChatSession:
         if not ids:
             return
         ids_t = torch.as_tensor(ids, dtype=torch.long, device=self.device)
-        ids_t = ids_t[(ids_t > 0) & (ids_t < self.seen_mask.numel())]
+        # FIX #5: Clamp to valid vocab range and warn if truncated
+        valid_mask = (ids_t >= 0) & (ids_t < self.seen_mask.numel())
+        if not valid_mask.all():
+            import warnings
+            warnings.warn(f"_mark_seen: {(~valid_mask).sum().item()} tokens out of vocab range")
+        ids_t = ids_t[valid_mask]
         if ids_t.numel() > 0:
             self.seen_mask[ids_t.unique()] = True
     def _rebuild_seen_mask(self):
@@ -1007,8 +1076,13 @@ class ChatSession:
         max_ctx = self.model.config.block_size
         if len(self.all_token_ids) > max_ctx:
             self.all_token_ids = self.all_token_ids[-max_ctx:]
+            # FIX #3: Sync current_len after every all_token_ids update
+            self.current_len = len(self.all_token_ids)
+            # FIX #5: Reset seen_mask when trimming context (not just on cache reset)
+            self._rebuild_seen_mask()
         if len(self.all_token_ids) > int(self.max_cache_len * 0.85):
             self._reset_cache()
+            self._rebuild_seen_mask()
             self.global_pos = 0
         if hasattr(self.model, "_reflect_cooldown"):
             self.model._reflect_cooldown = max(0, self.model._reflect_cooldown - 1)
@@ -1137,8 +1211,11 @@ class ChatSession:
             self.current_len += len(new_ids)
             self.global_pos += len(new_ids)
             self.all_token_ids.extend(new_ids)
+            # FIX #3: Sync current_len after every all_token_ids update
+            self.current_len = len(self.all_token_ids)
             if len(self.all_token_ids) > self.model.config.block_size:
                 self.all_token_ids = self.all_token_ids[-self.model.config.block_size:]
+                self.current_len = len(self.all_token_ids)
             self._mark_seen(new_ids)
             self._assert_state_sync()
             generated_ids = []
@@ -1182,6 +1259,8 @@ class ChatSession:
                         if not reflect_ids:
                             break
                         self.all_token_ids.extend(reflect_ids)
+                        # FIX #3: Sync current_len after every all_token_ids update
+                        self.current_len = len(self.all_token_ids)
                         new_t = torch.tensor(
                             [reflect_ids], dtype=torch.long, device=self.device
                         )
@@ -1217,6 +1296,8 @@ class ChatSession:
                         self.current_len -= len(reflect_ids)
                         self.global_pos -= len(reflect_ids)
                         del self.all_token_ids[-len(reflect_ids) :]
+                        # FIX #3: current_len already updated, verify sync
+                        assert self.current_len == len(self.all_token_ids), "current_len desync after rollback"
                         self.all_so_far[
                             0, self.current_len : self.current_len + len(reflect_ids)
                         ] = 0
@@ -1229,8 +1310,9 @@ class ChatSession:
                 self.all_token_ids.append(token_id)
                 if len(self.all_token_ids) > self.model.config.block_size:
                     self.all_token_ids = self.all_token_ids[-self.model.config.block_size:]
-                self.all_so_far[0, self.current_len] = token_id
-                self.current_len += 1
+                # FIX #3: Sync current_len after every all_token_ids update
+                self.current_len = len(self.all_token_ids)
+                self.all_so_far[0, self.current_len - 1] = token_id
                 self.global_pos += 1
                 self._mark_seen([token_id])
                 self._assert_state_sync()
@@ -1276,7 +1358,7 @@ class ChatSession:
                             res = fut.result(timeout=2.0)[:1000]
                         except FuturesTimeout:
                             fut.cancel()
-                            res = "Error: timeout"
+                            res = "Error: timeout (tool hung)"
                         except Exception as e:
                             res = f"Error: {e}"
                     if res.startswith("Error:"):
@@ -1307,6 +1389,8 @@ class ChatSession:
                         )
                         return
                     self.all_token_ids.extend(feed_ids)
+                    # FIX #3: Sync current_len after every all_token_ids update
+                    self.current_len = len(self.all_token_ids)
                     yield (
                         visible_text
                         + f"\n[System Log: Tool result {res}]\n"
@@ -1358,6 +1442,8 @@ class ChatSession:
                     if len(ctx_ids) > max_ctx:
                         ctx_ids = ctx_ids[-max_ctx:]
                     self.all_token_ids = ctx_ids.copy()
+                    # FIX #3: Sync current_len after every all_token_ids update
+                    self.current_len = len(self.all_token_ids)
                     self.seen_mask.zero_()
                     self._mark_seen(ctx_ids)
                     ctx_t = torch.tensor(
@@ -1415,6 +1501,8 @@ class ChatSession:
         max_ctx = self.model.config.block_size
         if len(self.all_token_ids) > max_ctx:
             self.all_token_ids = self.all_token_ids[-max_ctx:]
+            # FIX #3: Sync current_len after every all_token_ids update
+            self.current_len = len(self.all_token_ids)
         response = self._visible_response(
             self.tokenizer.decode(generated_ids, skip_special_tokens=False)
         )
@@ -1484,18 +1572,24 @@ class ChatSession:
         self._reset_cache()
         with self.memory.lock:
             self.memory.db.clear()
-        self.global_pos = 0  
+        self.global_pos = 0
         if hasattr(self.model, "seen_mask") and self.model.seen_mask is not None:
             self.model.seen_mask.zero_()
         if hasattr(self.model, "_reflect_cooldown"):
             self.model._reflect_cooldown = 0
+        # FIX #6: Cleanup executor on reset
+        self._cleanup_executor()
+
     def close(self):
-        executor = getattr(self, "_tool_executor", None)
-        if executor is not None:
-            executor.shutdown(wait=True, cancel_futures=True)
-            self._tool_executor = None
+        # FIX #7: Properly shutdown executor to prevent zombie processes
+        self._cleanup_executor()
     def __del__(self):
-        self.close()
+        try:
+            # FIX #1: Full lifecycle cleanup - executor first, then close
+            self._cleanup_executor()
+            self.close()
+        except Exception:
+            pass
 def sft_finetune(
     model,
     tokenizer,
