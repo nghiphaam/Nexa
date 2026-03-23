@@ -511,7 +511,11 @@ class VectorMemory:
         with self.lock:
             if not self.db:
                 return []
-            db_snapshot = list(self.db)
+            # NEXA 1.2: Clone tensors to prevent CUDA/CPU race condition
+            db_snapshot = [
+                (emb.clone(), raw_state.clone(), text, ts, memory_type)
+                for emb, raw_state, text, ts, memory_type in self.db
+            ]
             now = _time.monotonic()
         top_k = top_k or min(4, max(1, len(db_snapshot) // 5))
         # FIX #4: Use correct variable name
@@ -521,8 +525,8 @@ class VectorMemory:
         hits = []
         type_bonus = {"fact": 1.08, "tool_result": 1.04, "conversation": 1.0}
         for emb, _raw_state, text, ts, memory_type in db_snapshot:
-            # FIX #4: Clamp cosine similarity to prevent precision overflow
-            sim = float((q_emb * emb).sum())
+            # NEXA 1.2: Use F.cosine_similarity for guaranteed correctness
+            sim = F.cosine_similarity(q_emb, emb, dim=-1).item()
             sim = max(-1.0, min(1.0, sim))  # Clamp to [-1, 1]
             age = now - ts
             score = sim * math.exp(-decay * age) * type_bonus.get(memory_type, 1.0)
@@ -550,7 +554,11 @@ class VectorMemory:
         with self.lock:
             if not self.db:
                 return None
-            db_snapshot = list(self.db)
+            # NEXA 1.2: Clone tensors to prevent CUDA/CPU race condition
+            db_snapshot = [
+                (emb.clone(), raw_state.clone(), text, ts, memory_type)
+                for emb, raw_state, text, ts, memory_type in self.db
+            ]
             now = _time.monotonic()
         q_emb = self.embed(query_ids)
         if q_emb is None:
@@ -558,8 +566,8 @@ class VectorMemory:
         type_bonus = {"fact": 1.08, "tool_result": 1.04, "conversation": 1.0}
         scored = []
         for emb, raw_state, _text, ts, memory_type in db_snapshot:
-            # FIX #4: Clamp similarity here too (same as retrieve_kv)
-            sim = float((q_emb * emb).sum())
+            # NEXA 1.2: Use F.cosine_similarity for guaranteed correctness
+            sim = F.cosine_similarity(q_emb, emb, dim=-1).item()
             sim = max(-1.0, min(1.0, sim))
             age = now - ts
             score = sim * math.exp(-decay * age) * type_bonus.get(memory_type, 1.0)
@@ -576,6 +584,12 @@ class VectorMemory:
         weights = torch.tensor([max(s, 1e-4) for s, _ in top], dtype=target_dtype, device=target_device)
         weights = weights / weights.sum().clamp_min(1e-6)
         state = sum(w * raw.squeeze(0).to(dtype=target_dtype, device=target_device) for w, (_, raw) in zip(weights, top))
+
+        # NEXA 1.2: Check for zero vector before normalize to prevent NaN
+        state_norm = torch.norm(state)
+        if state_norm < 1e-6:
+            return None
+
         # FIX #3: Add eps to prevent NaN from zero vectors
         state = F.normalize(state, dim=-1, eps=1e-6)
         return state
@@ -724,10 +738,13 @@ class ChatSession:
         valid_mask = (ids_t >= 0) & (ids_t < self.seen_mask.numel())
         if not valid_mask.all():
             import warnings
+            # NEXA 1.2: Fix missing .item() in warning format
             warnings.warn(f"_mark_seen: {(~valid_mask).sum().item()} tokens out of vocab range")
         ids_t = ids_t[valid_mask]
-        if ids_t.numel() > 0:
-            self.seen_mask[ids_t.unique()] = True
+        # NEXA 1.2: Return early if all ids invalid to prevent silent skip
+        if ids_t.numel() == 0:
+            return
+        self.seen_mask[ids_t.unique()] = True
     def _rebuild_seen_mask(self):
         self.seen_mask.zero_()
         self._mark_seen(self.all_token_ids)
@@ -1358,6 +1375,9 @@ class ChatSession:
                             res = fut.result(timeout=2.0)[:1000]
                         except FuturesTimeout:
                             fut.cancel()
+                            # NEXA 1.2: Cleanup and recreate executor to kill zombie process
+                            self._cleanup_executor()
+                            self._ensure_executor()
                             res = "Error: timeout (tool hung)"
                         except Exception as e:
                             res = f"Error: {e}"
