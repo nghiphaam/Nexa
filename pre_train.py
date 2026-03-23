@@ -75,13 +75,13 @@ class NexaTokenizer:
         return type("E", (), {"ids": ids})()
 
     def encode_batch(self, texts):
-        # Keep alignment by returning None for empty texts instead of dropping
+        # NEXA 1.2: Return empty encoding object instead of None for safety
         results = []
         for t in texts:
             if t and t.strip():
                 results.append(self.encode(t))
             else:
-                results.append(None)  # Placeholder to maintain alignment
+                results.append(type("E", (), {"ids": []})())  # Empty encoding object
         return results
 
 

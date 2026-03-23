@@ -149,13 +149,14 @@ class NexaTokenizer:
         return type("E", (), {"ids": ids})()
 
     def encode_batch(self, texts):
-        # FIX #3: Keep alignment by returning None for empty texts (same as pre_train.py)
+        # NEXA 1.2: Return empty list for empty texts to prevent cross-module crashes
+        # This is safer than None which can cause silent failures
         results = []
         for t in texts:
             if t and t.strip():
                 results.append(self.encode(t))
             else:
-                results.append(None)  # Placeholder to maintain alignment
+                results.append(type("E", (), {"ids": []})())  # Empty encoding object
         return results
 
     def decode(self, ids, skip_special_tokens=True):
@@ -201,15 +202,15 @@ class Config:
     # Data
     data_dir: str = "data"
 
-    # Model
+    # Model - NEXA 1.2: Scaled to 1B parameters
     vocab_size: int = DEFAULT_VOCAB_SIZE
     eos_id: int = None
-    block_size: int = 384
-    sliding_window: int = 384  # Match block_size to prevent drift
-    n_embd: int = 1792
-    n_head: int = 16  # 1792 / 16 = 112 head_dim
+    block_size: int = 2048  # Increased for better context
+    sliding_window: int = 2048
+    n_embd: int = 2048  # 1B params: 2048 hidden dim
+    n_head: int = 16  # 2048 / 16 = 128 head_dim
     n_kv_head: int = 4  # GQA ratio = 4:1
-    n_layer: int = 28
+    n_layer: int = 24  # 24 layers for 1B scale
     dropout: float = 0.1
 
     # Training
@@ -293,15 +294,11 @@ def apply_rope(xq, xk, freqs_cos, freqs_sin):
             freqs_cos = freqs_cos[:seq_len]
             freqs_sin = freqs_sin[:seq_len]
         else:
-            # FIX #7: Truncate input instead of crashing (production-safe)
-            # This shouldn't happen if rope is precomputed correctly, but be defensive
-            import warnings
-            warnings.warn(
-                f"RoPE: seq_len={seq_len} > freq_len={freq_len}. "
-                f"Truncating to {freq_len}. Consider increasing block_size."
+            # NEXA 1.2: Raise error instead of silent truncate (data loss)
+            raise RuntimeError(
+                f"RoPE overflow: seq_len={seq_len} > freq_len={freq_len}. "
+                f"This causes data loss! Increase block_size in config."
             )
-            xq = xq[:, :, :freq_len, :]
-            xk = xk[:, :, :freq_len, :]
     xq_r = xq.float().reshape(*xq.shape[:-1], -1, 2)
     xk_r = xk.float().reshape(*xk.shape[:-1], -1, 2)
 
@@ -369,6 +366,12 @@ class KVCache:
     def update(self, k_val, v_val, w=None):
         bsz, n_h, seq_len, hd = k_val.shape
         w = min(w or self.max_len, self.max_len)
+
+        # NEXA 1.2: Prevent write_seq overflow in long-running sessions
+        if self.write_seq > 1_000_000:
+            self.reset()
+
+        # NEXA 1.2: Check filled drift edge case
         if (
             self.filled > self.max_len
             or self.write_seq < 0
@@ -456,6 +459,10 @@ class KVCache:
         # This ensures filled reflects actual valid tokens, not optimistic estimate
         valid = self.slot_seq >= 0
         self.filled = int(valid[0].sum().item())
+
+        # NEXA 1.2: Assert consistency after update
+        assert self.filled <= self.max_len, f"KVCache filled={self.filled} > max_len={self.max_len}"
+
         return self.get_kv_ordered()
 
     def rollback(self, n_tokens):
@@ -852,17 +859,25 @@ class NexaModel(nn.Module):
     ):
         """Sample with top-k, top-p, min-p, and repetition penalty.
         Pass `seen_mask` (bool tensor [vocab_size]) for O(1) penalty; otherwise falls back to O(n) scan.
+
+        NEXA 1.2: Proper sampling order and symmetric repetition penalty.
         """
+        # Step 1: Repetition penalty (symmetric - correct for negative logits)
         if repetition_penalty != 1.0:
             vocab_size = logits.size(-1)
             for b in range(logits.size(0)):
                 if seen_mask is not None:
                     # O(1) path: pre-built boolean mask
                     score = logits[b].clone()
-                    # FIX #6: Symmetric penalty - always penalize (reduce magnitude)
+                    # NEXA 1.2: Symmetric penalty - divide positive, multiply negative
+                    # This prevents boosting negative logits
                     logits[b] = torch.where(
                         seen_mask,
-                        score / repetition_penalty,  # Always divide to penalize
+                        torch.where(
+                            score > 0,
+                            score / repetition_penalty,
+                            score * repetition_penalty,
+                        ),
                         score,
                     )
                 else:
@@ -872,9 +887,14 @@ class NexaModel(nn.Module):
                     if seen.numel() > 0:
                         seen = seen.clamp(0, vocab_size - 1)
                         score = logits[b].clone()
-                        # FIX #6: Symmetric penalty
-                        logits[b, seen] = score[seen] / repetition_penalty
+                        # NEXA 1.2: Symmetric penalty
+                        logits[b, seen] = torch.where(
+                            score[seen] > 0,
+                            score[seen] / repetition_penalty,
+                            score[seen] * repetition_penalty,
+                        )
 
+        # Step 2: Temperature scaling
         temperature = max(float(temperature), 1e-5)
         logits = logits / temperature
         raw_logits = logits.clone()
@@ -882,23 +902,28 @@ class NexaModel(nn.Module):
         # NaN/Inf guard — preserve distribution shape
         logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
 
-        # Min-P filtering
+        # Step 3: Min-P filtering
         if min_p > 0.0:
             probs = F.softmax(logits, dim=-1)
             max_probs = probs.max(dim=-1, keepdim=True).values
             mask = probs < (min_p * max_probs)
             logits[mask] = float("-inf")
 
-        # Top-K filtering
+        # Step 4: Top-K filtering
         if top_k > 0:
             v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
             logits[logits < v[:, [-1]]] = float("-inf")
 
-        # Top-P (nucleus) filtering
+        # Step 5: Top-P (nucleus) filtering - NEXA 1.2: Fixed off-by-one
         if top_p < 1.0:
             sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-            sorted_mask = cumulative_probs - F.softmax(sorted_logits, dim=-1) >= top_p
+            sorted_probs = F.softmax(sorted_logits, dim=-1)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            # NEXA 1.2: Use > instead of >= to include threshold-crossing token
+            sorted_mask = cumulative_probs > top_p
+            # Shift mask right by 1 to keep the first token that exceeds top_p
+            sorted_mask[:, 1:] = sorted_mask[:, :-1].clone()
+            sorted_mask[:, 0] = False
             sorted_logits[sorted_mask] = float("-inf")
             logits = (
                 torch.empty_like(logits)
@@ -908,6 +933,8 @@ class NexaModel(nn.Module):
 
         if track_entropy:
             self._update_entropy_stats(raw_logits)
+
+        # Step 6: Final sampling with proper normalization
         probs = F.softmax(logits, dim=-1)
         # Renormalize to ensure sum=1 after filtering
         probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
