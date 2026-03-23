@@ -30,31 +30,71 @@ class DataLoaderLite:
         self.eos_id = eos_id
         self.batch_size = batch_size
         self.block_size = block_size
-        self.dataset = ChunkDataset(data_path, block_size)
+        self.data_path = data_path
 
-        n_w = min(4, os.cpu_count() or 1) if (is_cuda_device(device) or is_xla_device(device)) else 0
-        self.loader = torch.utils.data.DataLoader(
-            self.dataset, batch_size=batch_size, shuffle=True, drop_last=True,
-            num_workers=n_w, pin_memory=is_cuda_device(device),
-            persistent_workers=(n_w > 0 and (is_cuda_device(device) or is_xla_device(device))),
-            prefetch_factor=2 if n_w > 0 else None,
-        )
-        self.iter = iter(self.loader)
+        # TPU: use simple memmap without DataLoader to save RAM
+        if is_xla_device(device):
+            self.data = np.memmap(data_path, dtype=np.uint16, mode="r")
+            self.length = (len(self.data) - 1) // block_size
+            self.loader = None
+            self.iter = None
+        else:
+            self.dataset = ChunkDataset(data_path, block_size)
+            n_w = min(4, os.cpu_count() or 1) if is_cuda_device(device) else 0
+            self.loader = torch.utils.data.DataLoader(
+                self.dataset, batch_size=batch_size, shuffle=True, drop_last=True,
+                num_workers=n_w, pin_memory=is_cuda_device(device),
+                persistent_workers=(n_w > 0 and is_cuda_device(device)),
+                prefetch_factor=2 if n_w > 0 else None,
+            )
+            self.iter = iter(self.loader)
+            self.data = None
 
 
 class CUDAPrefetcher:
     def __init__(self, dataloader_lite):
         self.base_loader = dataloader_lite
-        self.loader = dataloader_lite.loader
-        self.iter = iter(self.loader)
-        self.stream = torch.cuda.Stream() if is_cuda_device(dataloader_lite.device) else None
         self.device = dataloader_lite.device
         self.eos_id = dataloader_lite.eos_id
+        self.batch_size = dataloader_lite.batch_size
+        self.block_size = dataloader_lite.block_size
+
+        # TPU: simple random sampling from memmap
+        if is_xla_device(self.device):
+            self.data = dataloader_lite.data
+            self.length = dataloader_lite.length
+            self.loader = None
+            self.iter = None
+            self.stream = None
+        else:
+            self.loader = dataloader_lite.loader
+            self.iter = iter(self.loader)
+            self.stream = torch.cuda.Stream() if is_cuda_device(self.device) else None
+            self.data = None
+
         self.next_x = None
         self.next_y = None
         self.preload()
 
     def preload(self):
+        # TPU: simple random batch sampling
+        if is_xla_device(self.device):
+            indices = np.random.randint(0, self.length, size=self.batch_size)
+            chunks = []
+            for idx in indices:
+                start = idx * self.block_size
+                chunk = self.data[start: start + self.block_size + 1]
+                chunks.append(torch.from_numpy(chunk.astype(np.int32)))
+            chunk = torch.stack(chunks)
+            x = chunk[:, :-1].contiguous()
+            y = chunk[:, 1:].contiguous().clone()
+            if self.eos_id is not None:
+                y[x == self.eos_id] = -100
+            self.next_x = x.to(self.device)
+            self.next_y = y.to(self.device)
+            return
+
+        # CUDA: use DataLoader
         try:
             chunk = next(self.iter)
         except StopIteration:
