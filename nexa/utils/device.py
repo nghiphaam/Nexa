@@ -84,7 +84,7 @@ def setup_distributed_xla():
     if not _HAS_XLA:
         raise RuntimeError("torch_xla is not available")
     device = xm.xla_device()
-    local_rank = xm.get_ordinal()
+    local_rank = xm.get_local_ordinal()
     world_size = xm.xrt_world_size()
     return local_rank, world_size, device
 
@@ -127,7 +127,7 @@ def get_rank():
     if is_distributed():
         return torch.distributed.get_rank()
     elif _HAS_XLA:
-        return xm.get_ordinal()
+        return xm.get_local_ordinal()
     return 0
 
 
