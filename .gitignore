@@ -37,10 +37,10 @@ data/
 *.arrow
 
 # -------------------
-# Tokenizer
+# Tokenizer models (not source code)
 # -------------------
-tokenizer/
 *.model
+*.tokenizer
 
 # -------------------
 # Logs / cache
