@@ -120,7 +120,7 @@ def load_training_dataset(
     return ds, label, dataset_repo, dataset_name
 
 
-def iter_stream_text_batches(ds, max_samples: int, batch_size: int = 1024):
+def iter_stream_text_batches(ds, max_samples: int, batch_size: int = 10000):
     batch = []
     stream = ds if max_samples <= 0 else islice(ds, max_samples)
     for item in stream:
@@ -166,9 +166,11 @@ def stream_tokenize_to_bins(
     val_path,
     np_dtype,
     max_samples: int = 0,
-    flush_tokens: int = 1_000_000,
+    flush_tokens: int = 5_000_000,
     val_ratio: float = 0.01,
 ):
+    from multiprocessing import Pool, cpu_count
+
     t0 = time.time()
     train_buffer = []
     val_buffer = []
@@ -179,43 +181,41 @@ def stream_tokenize_to_bins(
     val_tokens = 0
     rng = random.Random(42)
 
-    shuffle_buffer_size = max(10000, min(100000, max_samples or 100000))
+    def tokenize_batch(texts):
+        results = []
+        for text in texts:
+            if text and text.strip():
+                ids = tokenizer.encode(text).ids
+                if ids:
+                    ids.append(eos_id)
+                    results.append(ids)
+        return results
 
     with open(train_path, "wb") as train_f, open(val_path, "wb") as val_f:
-        stream = (
-            ds.shuffle(seed=42, buffer_size=shuffle_buffer_size)
-            if hasattr(ds, "shuffle")
-            else ds
-        )
-        stream = stream if max_samples <= 0 else islice(stream, max_samples)
-        for item in stream:
-            text = item.get("text", "")
-            if not text:
-                continue
-            ids = tokenizer.encode(text).ids
-            if not ids:
-                continue
-            ids.append(eos_id)
-            docs_seen += 1
+        for batch in iter_stream_text_batches(ds, max_samples, batch_size=10000):
+            batch_ids = tokenize_batch(batch)
 
-            if rng.random() < val_ratio:
-                val_buffer.extend(ids)
-                val_docs += 1
-            else:
-                train_buffer.extend(ids)
-                train_docs += 1
+            for ids in batch_ids:
+                docs_seen += 1
+                if rng.random() < val_ratio:
+                    val_buffer.extend(ids)
+                    val_docs += 1
+                else:
+                    train_buffer.extend(ids)
+                    train_docs += 1
 
             if len(train_buffer) >= flush_tokens:
                 train_tokens += _flush_token_buffer(train_f, train_buffer, np_dtype)
-            if len(val_buffer) >= max(100_000, flush_tokens // 10):
+            if len(val_buffer) >= max(500_000, flush_tokens // 10):
                 val_tokens += _flush_token_buffer(val_f, val_buffer, np_dtype)
 
             if docs_seen % 10000 == 0:
                 elapsed = time.time() - t0
+                rate = docs_seen / elapsed if elapsed > 0 else 0
                 print(
-                    f"  docs={docs_seen:,} train_docs={train_docs:,} val_docs={val_docs:,} "
+                    f"  docs={docs_seen:,} ({rate:.0f}/s) train={train_docs:,} val={val_docs:,} "
                     f"train_tok={train_tokens + len(train_buffer):,} val_tok={val_tokens + len(val_buffer):,} "
-                    f"| shuffle={shuffle_buffer_size:,} | {elapsed:.0f}s",
+                    f"| {elapsed:.0f}s",
                     end="\r",
                 )
 
@@ -285,28 +285,39 @@ def tokenize_dataset_in_memory(
     )
 
     def fast_tokenize(ds, out_path):
+        from multiprocessing import Pool, cpu_count
+
         t0 = time.time()
-        chunk_size = max(1000, min(200000, int(max(1.0, ram_gb) * 20000)))
+        chunk_size = max(5000, min(500000, int(max(1.0, ram_gb) * 50000)))
+        n_workers = max(1, cpu_count() - 1)
+
+        def tokenize_chunk(texts):
+            encodings = tokenizer.encode_batch(texts)
+            total_len = sum(len(enc.ids) + 1 for enc in encodings if enc is not None)
+            if total_len == 0:
+                return None
+            chunk = np.empty(total_len, dtype=np_dtype)
+            pos = 0
+            for enc in encodings:
+                if enc is None:
+                    continue
+                tok_len = len(enc.ids)
+                chunk[pos : pos + tok_len] = enc.ids
+                chunk[pos + tok_len] = eos_id
+                pos += tok_len + 1
+            return chunk
+
         with open(out_path, "wb") as f:
             for i in range(0, len(ds), chunk_size):
                 texts = ds[i : i + chunk_size]["text"]
-                encodings = tokenizer.encode_batch(texts)
-                # FIX #4: Handle None encodings from empty texts
-                total_len = sum(len(enc.ids) + 1 for enc in encodings if enc is not None)
-                if total_len == 0:
-                    continue
-                chunk = np.empty(total_len, dtype=np_dtype)
-                pos = 0
-                for enc in encodings:
-                    if enc is None:
-                        continue
-                    tok_len = len(enc.ids)
-                    chunk[pos : pos + tok_len] = enc.ids
-                    chunk[pos + tok_len] = eos_id
-                    pos += tok_len + 1
-                f.write(chunk.tobytes())
+                chunk = tokenize_chunk(texts)
+                if chunk is not None:
+                    f.write(chunk.tobytes())
+
+                elapsed = time.time() - t0
+                rate = (i + len(texts)) / elapsed if elapsed > 0 else 0
                 print(
-                    f"  {min(i + chunk_size, len(ds)):,}/{len(ds):,} docs | chunk={chunk_size:,} | {time.time() - t0:.0f}s",
+                    f"  {min(i + chunk_size, len(ds)):,}/{len(ds):,} docs ({rate:.0f}/s) | chunk={chunk_size:,} | {elapsed:.0f}s",
                     end="\r",
                 )
         mb = os.path.getsize(out_path) / 1e6
