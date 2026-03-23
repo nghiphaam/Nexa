@@ -279,30 +279,32 @@ def train(config: Config):
 
         # Gradient clipping and optimizer step
         norm = -1.0
-        if scaler is not None:
+
+        # XLA/TPU path
+        if is_xla_device(device):
+            if config.grad_clip > 0:
+                norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), config.grad_clip
+                ).item()
+            import torch_xla.core.xla_model as xm
+            xm.optimizer_step(optimizer, barrier=False)
+            xm.mark_step()
+        # CUDA/ROCm with AMP
+        elif scaler is not None:
             if config.grad_clip > 0:
                 scaler.unscale_(optimizer)
                 norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), config.grad_clip
                 ).item()
-
-            if is_xla_device(device):
-                optimizer.step()
-            else:
-                scaler.step(optimizer)
+            scaler.step(optimizer)
             scaler.update()
+        # CPU or CUDA without AMP
         else:
             if config.grad_clip > 0:
                 norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), config.grad_clip
                 ).item()
-
-            if is_xla_device(device):
-                import torch_xla.core.xla_model as xm
-                xm.optimizer_step(optimizer, barrier=False)
-                xm.mark_step()
-            else:
-                optimizer.step()
+            optimizer.step()
 
         # Periodic logging
         if it > 0 and it % config.log_interval == 0 and is_main_process:
