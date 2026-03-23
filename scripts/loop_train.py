@@ -120,8 +120,8 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         elif args.device.startswith("xla"):
-            import torch_xla.core.xla_model as xm
-            xm.mark_step()
+            from nexa.utils.device import sync_xla
+            sync_xla()
 
     print(f"\n✓ Done! Self-improvement dataset: {args.output}")
 
