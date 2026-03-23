@@ -1,0 +1,38 @@
+"""Device utilities for CUDA (single/multi-GPU), XLA/TPU, and CPU."""
+from nexa.utils.device import (
+    safe_cuda_alloc,
+    safe_xla_alloc,
+    get_xla_device,
+    is_cuda_device,
+    is_xla_device,
+    configure_tf32_runtime,
+    get_gpu_count,
+    get_tpu_count,
+    setup_distributed_cuda,
+    setup_distributed_xla,
+    get_device_info,
+    is_distributed,
+    get_rank,
+    get_world_size,
+    barrier,
+    auto_select_device,
+)
+
+__all__ = [
+    "safe_cuda_alloc",
+    "safe_xla_alloc",
+    "get_xla_device",
+    "is_cuda_device",
+    "is_xla_device",
+    "configure_tf32_runtime",
+    "get_gpu_count",
+    "get_tpu_count",
+    "setup_distributed_cuda",
+    "setup_distributed_xla",
+    "get_device_info",
+    "is_distributed",
+    "get_rank",
+    "get_world_size",
+    "barrier",
+    "auto_select_device",
+]
