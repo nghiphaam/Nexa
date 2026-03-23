@@ -1,6 +1,6 @@
 """Optimizer configuration."""
 import torch
-from nexa.utils.device import is_cuda_device
+from nexa.utils.device import is_cuda_device, is_rocm
 
 
 def configure_optimizer(model, config, device):
@@ -23,11 +23,13 @@ def configure_optimizer(model, config, device):
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
 
-    use_fused = is_cuda_device(device)
+    # Fused AdamW: CUDA only (not ROCm, not XLA)
+    use_fused = is_cuda_device(device) and not is_rocm()
     try:
         optimizer = torch.optim.AdamW(param_groups, lr=config.lr, betas=(0.9, 0.95), fused=use_fused)
         fused_str = "Fused" if use_fused else "Standard"
-    except TypeError:
+    except (TypeError, RuntimeError):
+        # Fallback if fused not supported
         optimizer = torch.optim.AdamW(param_groups, lr=config.lr, betas=(0.9, 0.95))
         fused_str = "Standard"
 

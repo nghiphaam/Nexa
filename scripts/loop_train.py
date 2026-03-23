@@ -23,7 +23,13 @@ def load_model(checkpoint_path: str, device: str = "cuda"):
     config = Config()
     model = NexaModel(config)
 
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    # Handle device mapping for different hardware
+    if device.startswith("xla"):
+        map_location = "cpu"
+    else:
+        map_location = device
+
+    ckpt = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
     model.load_state_dict(ckpt["model"])
     model = model.to(device)
     model.eval()
@@ -113,6 +119,9 @@ def main():
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        elif args.device.startswith("xla"):
+            import torch_xla.core.xla_model as xm
+            xm.mark_step()
 
     print(f"\n✓ Done! Self-improvement dataset: {args.output}")
 

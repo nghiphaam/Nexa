@@ -1,7 +1,7 @@
 """Auto-configuration based on hardware capabilities."""
 import torch
 from nexa.model.config import Config
-from nexa.utils.device import is_cuda_device, is_xla_device
+from nexa.utils.device import is_cuda_device, is_xla_device, is_rocm
 
 
 def auto_config(config: Config) -> Config:
@@ -9,7 +9,7 @@ def auto_config(config: Config) -> Config:
         config.dtype = "bfloat16"
         config.compile_model = False
         target_tokens = (50000 if config.preset == "auto"
-                         else {"low": 16000, "mid": 50000, "high": 120000}.get(config.preset, 50000))
+                        else {"low": 16000, "mid": 50000, "high": 120000}.get(config.preset, 50000))
         config.grad_accum_steps = max(1, target_tokens // max(1, config.batch_size * config.block_size))
         if config.sliding_window is None:
             config.sliding_window = max(config.block_size, 512)
@@ -31,8 +31,15 @@ def auto_config(config: Config) -> Config:
     vram_gb = props.total_memory / (1024**3)
     sm = props.major
 
-    config.dtype = "bfloat16" if torch.cuda.is_bf16_supported() else "float16"
-    config.compile_mode = "max-autotune" if sm >= 8 else "reduce-overhead"
+    # ROCm and CUDA dtype selection
+    if is_rocm():
+        # AMD ROCm: prefer bfloat16 for MI200+, float16 otherwise
+        config.dtype = "bfloat16" if vram_gb >= 64 else "float16"
+        config.compile_mode = "reduce-overhead"  # ROCm compile support varies
+    else:
+        # NVIDIA CUDA
+        config.dtype = "bfloat16" if torch.cuda.is_bf16_supported() else "float16"
+        config.compile_mode = "max-autotune" if sm >= 8 else "reduce-overhead"
 
     if config.preset == "auto":
         if vram_gb < 16:
@@ -45,7 +52,7 @@ def auto_config(config: Config) -> Config:
             config.batch_size = 4
 
     target_tokens = (20000 if config.preset == "auto"
-                     else {"low": 8000, "mid": 20000, "high": 50000}.get(config.preset, 20000))
+                    else {"low": 8000, "mid": 20000, "high": 50000}.get(config.preset, 20000))
     config.grad_accum_steps = max(1, target_tokens // max(1, config.batch_size * config.block_size))
 
     if config.block_size * config.n_layer > 4000:
@@ -59,7 +66,8 @@ def auto_config(config: Config) -> Config:
         max_tokens = kv_budget // (bytes_per_token * config.n_layer * config.batch_size)
         config.sliding_window = int(min(max_tokens, config.block_size * 2))
 
-    print(f"[auto_config] GPU={props.name} ({vram_gb:.1f}GB, sm_{props.major}{props.minor})")
+    device_type = "ROCm" if is_rocm() else "CUDA"
+    print(f"[auto_config] {device_type} GPU={props.name} ({vram_gb:.1f}GB, sm_{props.major}{props.minor})")
     print(f"[auto_config] dtype={config.dtype}, compile={config.compile_mode}, "
           f"batch={config.batch_size}, accum={config.grad_accum_steps}, "
           f"sliding_window={config.sliding_window}, grad_ckpt={config.use_grad_ckpt}")
