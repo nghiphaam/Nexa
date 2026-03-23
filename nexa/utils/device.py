@@ -64,11 +64,14 @@ def safe_cuda_alloc(device_id=0):
 
 
 def safe_xla_alloc():
+    """Test if XLA/TPU device can allocate memory safely."""
     if not _HAS_XLA:
         return False
     try:
         device = xm.xla_device()
-        torch.zeros((1,), device=device)
+        # Test with larger allocation to catch OOM issues
+        test = torch.zeros((1024, 1024), device=device)
+        del test
         return True
     except Exception:
         return False
@@ -85,6 +88,7 @@ def setup_distributed_cuda():
     if not torch.cuda.is_available():
         return 0, 1, "cpu"
     if "LOCAL_RANK" in os.environ:
+        from datetime import timedelta
         local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ.get("WORLD_SIZE", 1))
         if not torch.distributed.is_initialized():
@@ -92,12 +96,12 @@ def setup_distributed_cuda():
             backend = "nccl"
             if is_rocm():
                 try:
-                    torch.distributed.init_process_group(backend="nccl")
+                    torch.distributed.init_process_group(backend="nccl", timeout=timedelta(seconds=60))
                 except Exception:
                     backend = "gloo"
-                    torch.distributed.init_process_group(backend="gloo")
+                    torch.distributed.init_process_group(backend="gloo", timeout=timedelta(seconds=60))
             else:
-                torch.distributed.init_process_group(backend="nccl")
+                torch.distributed.init_process_group(backend="nccl", timeout=timedelta(seconds=60))
         torch.cuda.set_device(local_rank)
         device = f"cuda:{local_rank}"
         return local_rank, world_size, device
@@ -114,8 +118,14 @@ def setup_distributed_xla():
     return local_rank, world_size, device
 
 
-def get_device_info():
-    """Get comprehensive device information."""
+def get_device_info(include_all_devices=False):
+    """
+    Get comprehensive device information.
+
+    Args:
+        include_all_devices: If True, query all GPU properties (slower on multi-GPU).
+                           If False, only query device 0 (faster).
+    """
     info = {
         "cuda_available": torch.cuda.is_available(),
         "cuda_count": get_gpu_count(),
@@ -124,7 +134,7 @@ def get_device_info():
         "tpu_count": get_tpu_count(),
         "cpu_count": os.cpu_count() or 1,
     }
-    if info["cuda_available"]:
+    if info["cuda_available"] and include_all_devices:
         info["cuda_devices"] = []
         for i in range(info["cuda_count"]):
             props = torch.cuda.get_device_properties(i)
@@ -195,11 +205,19 @@ def configure_tf32_runtime():
 
 
 def auto_select_device(prefer_cuda=True):
+    """
+    Auto-select best available device.
+
+    IMPORTANT: Respects LOCAL_RANK for multi-GPU/DDP to avoid all processes using cuda:0.
+    """
+    # DDP: respect LOCAL_RANK to avoid all processes selecting cuda:0
     if "LOCAL_RANK" in os.environ:
         local_rank = int(os.environ["LOCAL_RANK"])
         if torch.cuda.is_available():
             return f"cuda:{local_rank}"
-    if prefer_cuda and safe_cuda_alloc(0):
+
+    # Single GPU/TPU selection
+    if prefer_cuda and torch.cuda.is_available() and safe_cuda_alloc(0):
         return "cuda:0"
     if safe_xla_alloc():
         return "xla"
@@ -207,11 +225,15 @@ def auto_select_device(prefer_cuda=True):
 
 
 def empty_cache(device=None):
-    """Clear device cache for CUDA/ROCm/XLA."""
+    """Clear device cache for CUDA/ROCm."""
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     if is_cuda_device(device) and torch.cuda.is_available():
         torch.cuda.empty_cache()
-    elif is_xla_device(device) and _HAS_XLA:
+
+
+def sync_xla():
+    """Synchronize XLA/TPU operations (flush graph, not memory clear)."""
+    if _HAS_XLA:
         xm.mark_step()
