@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -33,3 +33,6 @@ tpu = [
 [project.urls]
 Homepage = "https://github.com/nghiphaam/Nexa"
 Repository = "https://github.com/nghiphaam/Nexa"
+
+[tool.setuptools]
+packages = ["nexa", "nexa.model", "nexa.training", "nexa.inference", "nexa.serving", "nexa.utils", "nexa.tokenizer"]
