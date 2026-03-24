@@ -60,3 +60,22 @@ class Config:
     seed: int = 1337
     checkpoint_dir: str = "checkpoints"
     preset: str = "auto"
+
+    def __post_init__(self):
+        """Validate configuration after initialization."""
+        # GQA validation: n_head must be divisible by n_kv_head
+        if self.n_head % self.n_kv_head != 0:
+            raise ValueError(
+                f"n_head ({self.n_head}) must be divisible by n_kv_head ({self.n_kv_head}) "
+                f"for Grouped Query Attention. Got ratio: {self.n_head / self.n_kv_head}"
+            )
+
+        # Ensure positive values
+        if self.n_embd <= 0 or self.n_head <= 0 or self.n_kv_head <= 0 or self.n_layer <= 0:
+            raise ValueError("Model dimensions must be positive")
+
+        if self.block_size <= 0:
+            raise ValueError("block_size must be positive")
+
+        if self.batch_size <= 0:
+            raise ValueError("batch_size must be positive")

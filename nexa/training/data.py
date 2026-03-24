@@ -10,7 +10,14 @@ class ChunkDataset(torch.utils.data.Dataset):
         self.data_path = data_path
         self.block_size = block_size
         bytes_size = os.path.getsize(data_path)
-        self.length = ((bytes_size // 2) - 1) // block_size
+        # Ensure at least 1 sample if data is large enough
+        num_tokens = bytes_size // 2
+        if num_tokens < block_size + 1:
+            self.length = 0
+        else:
+            self.length = (num_tokens - block_size - 1) // block_size
+            if self.length == 0 and num_tokens >= block_size + 1:
+                self.length = 1
         self.data = None
 
     def __len__(self):
@@ -35,7 +42,13 @@ class DataLoaderLite:
         # TPU: use simple memmap without DataLoader to save RAM
         if is_xla_device(device):
             self.data = np.memmap(data_path, dtype=np.uint16, mode="r")
-            self.length = (len(self.data) - 1) // block_size
+            num_tokens = len(self.data)
+            if num_tokens < block_size + 1:
+                self.length = 0
+            else:
+                self.length = (num_tokens - block_size - 1) // block_size
+                if self.length == 0 and num_tokens >= block_size + 1:
+                    self.length = 1
             self.loader = None
             self.iter = None
         else:

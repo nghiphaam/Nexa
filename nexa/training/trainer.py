@@ -241,6 +241,12 @@ def train(config: Config):
                 torch.save(ckpt_data, os.path.join(config.checkpoint_dir, "best.pt"))
                 print(f"  ** best model saved (val={best_val:.4f})")
 
+            # Broadcast best_val to all processes to keep them in sync
+            if world_size > 1 and is_distributed():
+                best_val_tensor = torch.tensor([best_val], device=device)
+                torch.distributed.broadcast(best_val_tensor, src=0)
+                best_val = best_val_tensor.item()
+
             sample = generate_sample(
                 model, tokenizer, "The meaning of life is", 100, config, amp_ctx
             )
@@ -276,6 +282,10 @@ def train(config: Config):
                 loss.backward()
 
             accum_loss += loss.item()
+
+        # Synchronize gradients across processes before optimizer step
+        if world_size > 1 and is_distributed():
+            barrier()
 
         # Gradient clipping and optimizer step
         norm = -1.0

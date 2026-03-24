@@ -216,7 +216,16 @@ class NexaModel(nn.Module):
             self._update_entropy_stats(raw_logits)
 
         probs = F.softmax(logits, dim=-1)
-        probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        prob_sum = probs.sum(dim=-1, keepdim=True)
+
+        # Handle edge case: all probs filtered out (top-k/top-p/min-p too aggressive)
+        if (prob_sum == 0).any():
+            # Fallback to uniform distribution over non-inf logits
+            valid_mask = logits > float("-inf")
+            probs = torch.where(valid_mask, 1.0, 0.0)
+            prob_sum = probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+        probs = probs / prob_sum.clamp(min=1e-8)
         return torch.multinomial(probs, num_samples=1)
 
     def _should_reflect(self, temperature: float) -> bool:
@@ -234,6 +243,13 @@ class NexaModel(nn.Module):
                  min_p=0.05, repetition_penalty=1.1, caches=None, draft_model=None,
                  gamma=4, head="main", memory_state=None, memory_query_state=None):
         self.eval()
+
+        B, T = idx.size()
+
+        # Edge case: empty input
+        if T == 0:
+            raise ValueError("Cannot generate from empty input (T=0)")
+
         if getattr(self, "_spec_disable_steps", 0) > 0:
             draft_model = None
             self._spec_disable_steps = max(0, self._spec_disable_steps - max_new_tokens)
@@ -380,5 +396,8 @@ class NexaModel(nn.Module):
                 x = self.transformer.ln_f(x)
                 logits = self._project_logits(x[:, -1, :], head=head)
                 current_len += 1
-        except Exception:
-            return
+        except Exception as e:
+            import logging
+            logging.error(f"Generation stream failed at token {current_len - T}: {e}")
+            # Yield error indicator or re-raise
+            raise
