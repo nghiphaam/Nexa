@@ -74,6 +74,11 @@ class Config:
         if self.n_embd <= 0 or self.n_head <= 0 or self.n_kv_head <= 0 or self.n_layer <= 0:
             raise ValueError("Model dimensions must be positive")
 
+        if self.n_embd % self.n_head != 0:
+            raise ValueError(
+                f"n_embd ({self.n_embd}) must be divisible by n_head ({self.n_head})"
+            )
+
         if self.block_size <= 0:
             raise ValueError("block_size must be positive")
 

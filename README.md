@@ -1,127 +1,99 @@
-# Nexa 🌌
+# Nexa
 
-![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)
+Nexa is a compact transformer codebase for text generation, distributed training, and experimental multimodal image-text training.
 
-Nexa is an advanced, lightweight, open-source language model designed for high efficiency, flexible experimentation, and modern generative AI architectures. Grounded in a highly optimized codebase, Nexa brings modern architectural advancements alongside a full-stack reasoning engine.
+## What is in this repo
 
-## 🌟 Key Features
+### Text model
+- `NexaModel` in [nexa/model/nexa_model.py](nexa/model/nexa_model.py)
+- GQA attention, SwiGLU FFN, RMSNorm, RoPE, KV cache
+- Sampling with top-k, top-p, min-p, repetition penalty
+- Critic heads and memory-state injection hooks
 
-### 🏗 Architecture
-- **Modern Transformer Backbone:** Utilizes Grouped-Query Attention (GQA), SwiGLU Feed-Forward Networks (FFN), RMSNorm, and Rotary Position Embeddings (RoPE).
-- **Inference Optimizations:** Features an efficient KV Cache with precise temporal slot tracking, memory-state injections, and Speculative Decoding for accelerated local inference.
+### Training
+- Main trainer in [nexa/training/trainer.py](nexa/training/trainer.py)
+- CUDA / ROCm / TPU-aware data loading and training utilities
+- DDP support for multi-GPU runs
+- TPU/XLA-specific lightweight memmap sampling path
 
-### 🧠 Reasoning & Agent Engine
-- **Internal Reasoning Engine:** An autonomous reasoning loop built directly into the chat runtime that orchestrates a **Planner**, a **Critic model**, and multi-path thought exploration to robustly verify and improve its own answers.
-- **Agent Tool Calling:** Embedded Python Sandbox mechanism allows Nexa to robustly execute `CALL: python(...)` queries, interact with tools, and cleanly route execution outputs directly back into the context window.
-- **Long-term Vector Memory:** Intercepts, retrieves, and maintains cross-turn historical context intelligently seamlessly injecting hidden conversational details into the main token stream.
+### Tokenization
+- Base tokenizer exports in [nexa/tokenizer/__init__.py](nexa/tokenizer/__init__.py)
+- Multimodal special-token helpers in [nexa/tokenizer/multimodal_tokenizer.py](nexa/tokenizer/multimodal_tokenizer.py)
 
-### 💿 Pre-training Pipeline
-- **Smart Data Preparation:** `pre_train.py` manages end-to-end extraction from Hugging Face datasets.
-- **Dynamic Streaming:** Uses system RAM heuristics to decide whether to map data fully in-memory or cleanly stream huge corpora directly to `train.bin` and `val.bin`.
+### Multimodal image understanding (Nexa 1.5)
+- `MultimodalModel` in [nexa/model/multimodal_model.py](nexa/model/multimodal_model.py)
+- Frozen SigLIP vision encoder in [nexa/vision/vision_encoder.py](nexa/vision/vision_encoder.py)
+- Vision projector, image-text gate, image dropout, patch selection, image preprocessing in [nexa/vision/](nexa/vision/)
+- Multimodal trainer, contrastive loss, collapse detection, curriculum loader, and image usage tracking in [nexa/training/](nexa/training/)
 
----
+## Current status
 
-## 📂 Project Structure
+### Implemented
+- Text-only training and generation
+- Multi-GPU / TPU-aware training infrastructure
+- Multimodal image-text training path
+- Multimodal special-token utilities
 
-- `lm.py`: The core LLM framework. Houses model architecture (Transformer blocks, Memory state projection, Critic adapters), the deep learning training loop, and the generation CLI.
-- `chat.py`: The full-fledge runtime environment. Controls conversational formatting, the reasoning engine, speculative tool calls, history sliding-window, and both CLI and Web (Gradio) user interfaces.
-- `pre_train.py`: Standalone dataset downloader and binary mapping utility. Builds system-aware chunks and `dataset_manifest.json`.
+### Not implemented yet
+- Full multimodal autoregressive generation in `MultimodalModel.generate()`
+  - Current behavior explicitly raises `NotImplementedError` when `images` are passed for generation.
+  - Training and evaluation with `forward(..., images=...)` are implemented.
 
----
+## Install
 
-## 🚀 Installation
-
-Ensure you are using Python 3.10+ and set up your virtual environment:
+Use Python 3.10+.
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install torch numpy datasets huggingface_hub tiktoken gradio
+pip install torch numpy tokenizers transformers pillow tensorboard
 ```
 
-*Note: If you use TPU/XLA or ROCm, ensure you install the mutually compatible `torch` build for your specific environment.*
+For TPU/XLA or ROCm, install the matching PyTorch build for your environment.
 
----
+## Quick start
 
-## 🛠️ Usage Pipeline
+### Import the package
 
-### 1. Data Preparation
-
-Nexa does not assume a default dataset. Use the standalone `pre_train.py` script to fetch, map, and serialize text corpora into optimized BPE tokenized binary files.
-
-```bash
-python pre_train.py --dataset HuggingFaceFW/fineweb-edu --data-dir data
+```python
+from nexa import Config, NexaModel, MultimodalModel, load_tokenizer
 ```
 
-**Advanced options:**
-```bash
-python pre_train.py \
-  --dataset ptb_text_only \
-  --dataset-config default \
-  --data-dir data \
-  --max-samples 1000000 \
-  --force-stream
+### Text model
+
+```python
+from nexa import Config, NexaModel, load_tokenizer
+
+config = Config(device="cpu")
+tokenizer = load_tokenizer()
+config.vocab_size = tokenizer.get_vocab_size()
+model = NexaModel(config)
 ```
 
-### 2. Pre-Training / Fine-tuning
+### Multimodal model
 
-Once `train.bin` and `val.bin` are securely written:
+```python
+from nexa import Config, MultimodalModel
+from nexa.tokenizer.multimodal_tokenizer import add_multimodal_tokens
 
-```bash
-python lm.py --data-dir data
+config = Config(device="cpu")
+model = MultimodalModel(config)
 ```
 
-You can target specific pre-defined network volumes using `--preset`:
-```bash
-python lm.py --data-dir data --preset low   # Best for debugging / tiny scale
-python lm.py --data-dir data --preset mid
-python lm.py --data-dir data --preset high
-```
+## Main package layout
 
-### 3. Generation (Raw CLI)
+- [nexa/](nexa/)
+  - [nexa/model/](nexa/model/)
+  - [nexa/tokenizer/](nexa/tokenizer/)
+  - [nexa/training/](nexa/training/)
+  - [nexa/vision/](nexa/vision/)
+  - [nexa/utils/](nexa/utils/)
 
-Validate model generation capacity independently from the chat subsystem:
+## Notes
 
-```bash
-python lm.py --data-dir data --generate --prompt "The fundamental theorem of calculus states that"
-```
+- The README reflects the current package layout, not the older `lm.py` / `chat.py` structure.
+- If you need production multimodal inference, that part still needs implementation on top of the current training stack.
 
-### 4. Interactive Chat (Agent / Reasoning)
+## License
 
-The chat runtime supports local persistent history, reasoning paths, and vector memory.
-Point it to your `.pt` checkpoint.
-
-**Terminal CLI Mode:**
-```bash
-python chat.py --checkpoint checkpoints/best.pt --cli
-```
-
-**Web UI Mode (Gradio):**
-```bash
-python chat.py --checkpoint checkpoints/best.pt
-```
-
-**Docker WebUI Mode (Full Stack):**
-Nexa now supports a full-stack WebUI using Open WebUI and Docker. This setup includes:
-- **Nexa API:** An OpenAI-compatible API server running Nexa.
-- **Open WebUI:** A feature-rich interface for interacting with the model.
-- **Cloudflared:** (Optional) For secure remote access via Cloudflare Tunnels.
-
-To launch the stack:
-```bash
-cd Nexa
-docker-compose up -d
-```
-The interface will be available at `http://localhost:3000`.
-
----
-
-## 📝 Design Philosophy & Notes
-
-- **Modularity:** Tokenization strictly leverages optimized BPE vocabulary format to standardize cross-platform testing without muddying the model logic.
-- **Decoupled Processing:** `lm.py` is entirely separated from dataset formatting logic, strictly consuming MemMap arrays. This prevents memory leaks during training and standardizes benchmark ingestion.
-- **Robust formatting:** Linting rules and architecture patterns strictly adhere to `ruff` and `black` Python integrations ensuring maximum readability.
-
-## 📄 License
-
-This repository is distributed under the **Apache License 2.0**. See the `LICENSE` file for more details.
+Apache 2.0. See [LICENSE](LICENSE).

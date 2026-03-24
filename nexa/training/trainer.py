@@ -261,6 +261,7 @@ def train(config: Config):
 
         # Training step
         accum_loss = 0.0
+        skip_step = False
         optimizer.zero_grad(set_to_none=True)
 
         for micro_step in range(config.grad_accum_steps):
@@ -272,8 +273,9 @@ def train(config: Config):
 
             if not torch.isfinite(loss):
                 if is_main_process:
-                    print(f"\n[warn] NaN loss at step={it}. Skipping.")
+                    print(f"\n[warn] NaN loss at step={it}. Skipping optimizer step.")
                 optimizer.zero_grad(set_to_none=True)
+                skip_step = True
                 break
 
             if scaler is not None:
@@ -290,31 +292,34 @@ def train(config: Config):
         # Gradient clipping and optimizer step
         norm = -1.0
 
-        # XLA/TPU path
-        if is_xla_device(device):
-            if config.grad_clip > 0:
-                norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), config.grad_clip
-                ).item()
-            import torch_xla.core.xla_model as xm
-            xm.optimizer_step(optimizer, barrier=False)
-            xm.mark_step()
-        # CUDA/ROCm with AMP
-        elif scaler is not None:
-            if config.grad_clip > 0:
-                scaler.unscale_(optimizer)
-                norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), config.grad_clip
-                ).item()
-            scaler.step(optimizer)
-            scaler.update()
-        # CPU or CUDA without AMP
-        else:
-            if config.grad_clip > 0:
-                norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), config.grad_clip
-                ).item()
-            optimizer.step()
+        if not skip_step:
+            # XLA/TPU path
+            if is_xla_device(device):
+                if config.grad_clip > 0:
+                    norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), config.grad_clip
+                    ).item()
+                import torch_xla.core.xla_model as xm
+                xm.optimizer_step(optimizer, barrier=False)
+                xm.mark_step()
+            # CUDA/ROCm with AMP
+            elif scaler is not None:
+                if config.grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), config.grad_clip
+                    ).item()
+                scaler.step(optimizer)
+                scaler.update()
+            # CPU or CUDA without AMP
+            else:
+                if config.grad_clip > 0:
+                    norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), config.grad_clip
+                    ).item()
+                optimizer.step()
+
+        optimizer.zero_grad(set_to_none=True)
 
         # Periodic logging
         if it > 0 and it % config.log_interval == 0 and is_main_process:

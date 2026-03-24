@@ -9,7 +9,12 @@ from nexa.utils.device import is_cuda_device, is_xla_device
 
 
 def get_random_batch(data, block_size, batch_size, device):
-    ix = torch.randint(len(data) - block_size, (batch_size,))
+    max_start = len(data) - block_size
+    if max_start <= 0:
+        raise ValueError(
+            f"Dataset too small for block_size={block_size}: got {len(data)} tokens"
+        )
+    ix = torch.randint(max_start, (batch_size,))
     x = torch.stack([torch.from_numpy(data[i: i + block_size].astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy(data[i + 1: i + 1 + block_size].astype(np.int64)) for i in ix])
     if is_cuda_device(device):
@@ -26,7 +31,7 @@ def make_amp_context(device, dtype):
     if dtype not in (torch.float16, torch.bfloat16):
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     try:
-        return torch.amp.autocast(device_type=device, dtype=dtype)
+        return torch.amp.autocast(device_type="cuda", dtype=dtype)
     except Exception:
         return contextlib.nullcontext()
 

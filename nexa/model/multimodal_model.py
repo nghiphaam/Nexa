@@ -158,11 +158,7 @@ class MultimodalModel(nn.Module):
         if images is None:
             return self.text_model.generate(input_ids, max_new_tokens, **kwargs)
 
-        # Encode image and prepend to input
-        image_tokens, _ = self.encode_image(images, training=False)
-        text_emb = self.text_model.transformer.wte(input_ids)
-        x = torch.cat([image_tokens, text_emb], dim=1)
-
-        # For now, generate from text model using input_ids only (simple fallback)
-        # Full multimodal generation would require extending NexaModel.generate()
-        return self.text_model.generate(input_ids, max_new_tokens, **kwargs)
+        raise NotImplementedError(
+            "Multimodal generation is not implemented yet. "
+            "Use forward(..., images=...) for training/evaluation only."
+        )

@@ -220,7 +220,6 @@ class NexaModel(nn.Module):
 
         # Handle edge case: all probs filtered out (top-k/top-p/min-p too aggressive)
         if (prob_sum == 0).any():
-            # Fallback to uniform distribution over non-inf logits
             valid_mask = logits > float("-inf")
             probs = torch.where(valid_mask, 1.0, 0.0)
             prob_sum = probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
@@ -242,103 +241,159 @@ class NexaModel(nn.Module):
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=0, top_p=0.9,
                  min_p=0.05, repetition_penalty=1.1, caches=None, draft_model=None,
                  gamma=4, head="main", memory_state=None, memory_query_state=None):
+        was_training = self.training
         self.eval()
 
         B, T = idx.size()
 
-        # Edge case: empty input
         if T == 0:
             raise ValueError("Cannot generate from empty input (T=0)")
+        if max_new_tokens <= 0:
+            raise ValueError(f"max_new_tokens must be > 0, got {max_new_tokens}")
+        if max_new_tokens >= self.config.block_size:
+            raise ValueError(
+                f"max_new_tokens ({max_new_tokens}) must be smaller than block_size ({self.config.block_size})"
+            )
 
-        if getattr(self, "_spec_disable_steps", 0) > 0:
-            draft_model = None
-            self._spec_disable_steps = max(0, self._spec_disable_steps - max_new_tokens)
-        if draft_model:
+        original_draft_training = None
+        if draft_model is not None:
+            original_draft_training = draft_model.training
             draft_model.eval()
-        if hasattr(self, "_reflect_cooldown"):
-            self._reflect_cooldown = max(0, self._reflect_cooldown - 1)
-        n_layers = len(self.transformer.h)
 
-        B, T = idx.size()
-        if T + max_new_tokens > self.config.block_size:
-            idx = idx[:, -(self.config.block_size - max_new_tokens):]
-            T = idx.size(1)
+        try:
+            if getattr(self, "_spec_disable_steps", 0) > 0:
+                draft_model = None
+                self._spec_disable_steps = max(0, self._spec_disable_steps - max_new_tokens)
+            if hasattr(self, "_reflect_cooldown"):
+                self._reflect_cooldown = max(0, self._reflect_cooldown - 1)
+            n_layers = len(self.transformer.h)
 
-        if caches is None:
-            max_cache_len = min(T + max_new_tokens,
-                                getattr(self.config, "sliding_window", None) or self.config.block_size)
-            head_dim = self.config.n_embd // self.config.n_head
-            caches = [
-                KVCache(B, max_cache_len, self.config.n_kv_head, head_dim, idx.device,
+            if T + max_new_tokens > self.config.block_size:
+                idx = idx[:, -(self.config.block_size - max_new_tokens):]
+                T = idx.size(1)
+
+            if caches is None:
+                max_cache_len = min(
+                    T + max_new_tokens,
+                    getattr(self.config, "sliding_window", None) or self.config.block_size,
+                )
+                head_dim = self.config.n_embd // self.config.n_head
+                caches = [
+                    KVCache(
+                        B,
+                        max_cache_len,
+                        self.config.n_kv_head,
+                        head_dim,
+                        idx.device,
                         self.transformer.wte.weight.dtype,
-                        n_global_tokens=getattr(self.config, "n_global_tokens", 0))
-                for _ in range(n_layers)
-            ]
+                        n_global_tokens=getattr(self.config, "n_global_tokens", 0),
+                    )
+                    for _ in range(n_layers)
+                ]
 
-        # Prefill
-        x = self.transformer.drop(self.transformer.wte(idx))
-        x = self._apply_memory_state(x, memory_state, memory_query_state)
-        freqs_cos = self.freqs_cos[:T]
-        freqs_sin = self.freqs_sin[:T]
-        for i, block in enumerate(self.transformer.h):
-            x, caches[i] = block(x, freqs_cos, freqs_sin, kv_cache=caches[i])
-        x = self.transformer.ln_f(x)
-        logits = self._project_logits(x[:, -1, :], head=head)
-
-        max_total_len = T + max_new_tokens
-        all_so_far = torch.zeros((B, max_total_len), dtype=torch.long, device=idx.device)
-        all_so_far[:, :T] = idx
-        current_len = T
-        seen_mask = None
-        if B == 1:
-            seen_mask = torch.zeros(self.config.vocab_size, dtype=torch.bool, device=idx.device)
-            init_ids = idx[0]
-            init_ids = init_ids[(init_ids > 0) & (init_ids < self.config.vocab_size)]
-            if init_ids.numel() > 0:
-                seen_mask[init_ids.unique()] = True
-
-        idx_next = self._sample_token(logits, all_so_far[:, :current_len], temperature,
-                                       top_k, top_p, min_p, repetition_penalty, seen_mask=seen_mask)
-        all_so_far[:, current_len] = idx_next.squeeze()
-        if seen_mask is not None:
-            seen_mask[idx_next.squeeze().clamp(0, self.config.vocab_size - 1)] = True
-        current_len += 1
-
-        eos_id = getattr(self.config, "eos_id", -1)
-        while current_len < T + max_new_tokens:
-            if eos_id >= 0 and (idx_next.squeeze(-1) == eos_id).all():
-                break
-            x = self.transformer.wte(idx_next)
+            x = self.transformer.drop(self.transformer.wte(idx))
             x = self._apply_memory_state(x, memory_state, memory_query_state)
-            pos = (current_len - 1) % self.freqs_cos.size(0)
-            fc = self.freqs_cos[pos: pos + 1]
-            fs = self.freqs_sin[pos: pos + 1]
+            freqs_cos = self.freqs_cos[:T]
+            freqs_sin = self.freqs_sin[:T]
             for i, block in enumerate(self.transformer.h):
-                x, caches[i] = block(x, fc, fs, kv_cache=caches[i])
+                x, caches[i] = block(x, freqs_cos, freqs_sin, kv_cache=caches[i])
             x = self.transformer.ln_f(x)
             logits = self._project_logits(x[:, -1, :], head=head)
-            idx_next = self._sample_token(logits, all_so_far[:, :current_len], temperature,
-                                           top_k, top_p, min_p, repetition_penalty, seen_mask=seen_mask)
+
+            max_total_len = T + max_new_tokens
+            all_so_far = torch.zeros((B, max_total_len), dtype=torch.long, device=idx.device)
+            all_so_far[:, :T] = idx
+            current_len = T
+            seen_mask = None
+            if B == 1:
+                seen_mask = torch.zeros(self.config.vocab_size, dtype=torch.bool, device=idx.device)
+                init_ids = idx[0]
+                init_ids = init_ids[(init_ids > 0) & (init_ids < self.config.vocab_size)]
+                if init_ids.numel() > 0:
+                    seen_mask[init_ids.unique()] = True
+
+            idx_next = self._sample_token(
+                logits,
+                all_so_far[:, :current_len],
+                temperature,
+                top_k,
+                top_p,
+                min_p,
+                repetition_penalty,
+                seen_mask=seen_mask,
+            )
             all_so_far[:, current_len] = idx_next.squeeze()
             if seen_mask is not None:
                 seen_mask[idx_next.squeeze().clamp(0, self.config.vocab_size - 1)] = True
             current_len += 1
 
-        self.train()
-        return all_so_far[:, :current_len]
+            eos_id = getattr(self.config, "eos_id", -1)
+            while current_len < T + max_new_tokens:
+                if eos_id >= 0 and (idx_next.squeeze(-1) == eos_id).all():
+                    break
+                x = self.transformer.wte(idx_next)
+                x = self._apply_memory_state(x, memory_state, memory_query_state)
+                pos = (current_len - 1) % self.freqs_cos.size(0)
+                fc = self.freqs_cos[pos: pos + 1]
+                fs = self.freqs_sin[pos: pos + 1]
+                for i, block in enumerate(self.transformer.h):
+                    x, caches[i] = block(x, fc, fs, kv_cache=caches[i])
+                x = self.transformer.ln_f(x)
+                logits = self._project_logits(x[:, -1, :], head=head)
+                idx_next = self._sample_token(
+                    logits,
+                    all_so_far[:, :current_len],
+                    temperature,
+                    top_k,
+                    top_p,
+                    min_p,
+                    repetition_penalty,
+                    seen_mask=seen_mask,
+                )
+                all_so_far[:, current_len] = idx_next.squeeze()
+                if seen_mask is not None:
+                    seen_mask[idx_next.squeeze().clamp(0, self.config.vocab_size - 1)] = True
+                current_len += 1
+
+            return all_so_far[:, :current_len]
+        finally:
+            self.train(was_training)
+            if draft_model is not None and original_draft_training is not None:
+                draft_model.train(original_draft_training)
 
     @torch.no_grad()
     def generate_stream(self, idx, max_new_tokens, temperature=1.0, top_k=0, top_p=0.9,
                         min_p=0.05, repetition_penalty=1.1, head="main",
                         memory_state=None, memory_query_state=None):
+        was_training = self.training
+        current_len = 0
+        orig_T = idx.size(1)
         try:
             self.eval()
             B, T = idx.size()
+            orig_T = T
+            if T == 0:
+                raise ValueError("Cannot generate from empty input (T=0)")
+            if max_new_tokens <= 0:
+                raise ValueError(f"max_new_tokens must be > 0, got {max_new_tokens}")
+            if max_new_tokens >= self.config.block_size:
+                raise ValueError(
+                    f"max_new_tokens ({max_new_tokens}) must be smaller than block_size ({self.config.block_size})"
+                )
+
             if B != 1:
-                out = self.generate(idx, max_new_tokens=max_new_tokens, temperature=temperature,
-                                    top_k=top_k, top_p=top_p, min_p=min_p,
-                                    repetition_penalty=repetition_penalty, head=head,
-                                    memory_state=memory_state, memory_query_state=memory_query_state)
+                out = self.generate(
+                    idx,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    min_p=min_p,
+                    repetition_penalty=repetition_penalty,
+                    head=head,
+                    memory_state=memory_state,
+                    memory_query_state=memory_query_state,
+                )
                 for tok in out[0, T:].tolist():
                     yield tok
                 return
@@ -348,13 +403,21 @@ class NexaModel(nn.Module):
                 idx = idx[:, -(self.config.block_size - max_new_tokens):]
                 T = idx.size(1)
 
-            max_cache_len = min(T + max_new_tokens,
-                                getattr(self.config, "sliding_window", None) or self.config.block_size)
+            max_cache_len = min(
+                T + max_new_tokens,
+                getattr(self.config, "sliding_window", None) or self.config.block_size,
+            )
             head_dim = self.config.n_embd // self.config.n_head
             caches = [
-                KVCache(B, max_cache_len, self.config.n_kv_head, head_dim, idx.device,
-                        self.transformer.wte.weight.dtype,
-                        n_global_tokens=getattr(self.config, "n_global_tokens", 0))
+                KVCache(
+                    B,
+                    max_cache_len,
+                    self.config.n_kv_head,
+                    head_dim,
+                    idx.device,
+                    self.transformer.wte.weight.dtype,
+                    n_global_tokens=getattr(self.config, "n_global_tokens", 0),
+                )
                 for _ in range(n_layers)
             ]
 
@@ -377,8 +440,16 @@ class NexaModel(nn.Module):
             eos_id = getattr(self.config, "eos_id", -1)
             current_len = T
             for _ in range(max_new_tokens):
-                idx_next = self._sample_token(logits, all_so_far, temperature, top_k, top_p,
-                                               min_p, repetition_penalty, seen_mask=seen_mask)
+                idx_next = self._sample_token(
+                    logits,
+                    all_so_far,
+                    temperature,
+                    top_k,
+                    top_p,
+                    min_p,
+                    repetition_penalty,
+                    seen_mask=seen_mask,
+                )
                 token_id = int(idx_next.item())
                 yield token_id
                 if 0 <= token_id < self.config.vocab_size:
@@ -398,6 +469,7 @@ class NexaModel(nn.Module):
                 current_len += 1
         except Exception as e:
             import logging
-            logging.error(f"Generation stream failed at token {current_len - T}: {e}")
-            # Yield error indicator or re-raise
+            logging.error(f"Generation stream failed at token {current_len - orig_T}: {e}")
             raise
+        finally:
+            self.train(was_training)

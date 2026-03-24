@@ -49,6 +49,10 @@ class DataLoaderLite:
                 self.length = (num_tokens - block_size - 1) // block_size
                 if self.length == 0 and num_tokens >= block_size + 1:
                     self.length = 1
+            if self.length == 0:
+                raise ValueError(
+                    f"Dataset {data_path} is too small for block_size={block_size}: got {num_tokens} tokens"
+                )
             self.loader = None
             self.iter = None
         else:
