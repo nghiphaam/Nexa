@@ -89,9 +89,11 @@ def main():
     elif args.device == "cpu":
         device_str = "cpu"
     elif args.device in ("xla", "tpu"):
+        device_str = "xla"
         if not safe_xla_alloc():
             raise RuntimeError("XLA/TPU requested but not available")
-        device_str = str(get_xla_device())
+        get_xla_device()  # initialize and cache once
+        device_str = "xla"
     elif args.device == "cuda":
         if not safe_cuda_alloc(0):
             raise RuntimeError("CUDA requested but not available")

@@ -72,30 +72,35 @@ def safe_xla_alloc():
     if not _HAS_XLA:
         return False
     try:
-        # Use cached device if available
         if _XLA_DEVICE_CACHE is None:
             _XLA_DEVICE_CACHE = xm.xla_device()
-        device = _XLA_DEVICE_CACHE
-        # Test with smaller allocation - TPU initialization can be slow
-        test = torch.zeros((10, 10), device=device)
-        xm.mark_step()  # Force synchronization
+        test = torch.zeros((10, 10), device=_XLA_DEVICE_CACHE)
+        xm.mark_step()
         del test
         return True
     except Exception as e:
-        # If we have torch_xla but allocation fails, still return True
-        # The actual training will fail with a better error message
         print(f"Warning: XLA allocation test failed: {e}")
-        return True if _HAS_XLA else False
+        _XLA_DEVICE_CACHE = None
+        return False
 
 
 def get_xla_device():
     global _XLA_DEVICE_CACHE
     if not _HAS_XLA:
         raise RuntimeError("torch_xla is not available")
-    # Return cached device to avoid re-initialization
     if _XLA_DEVICE_CACHE is None:
         _XLA_DEVICE_CACHE = xm.xla_device()
     return _XLA_DEVICE_CACHE
+
+
+def has_xla_device():
+    return safe_xla_alloc() or _XLA_DEVICE_CACHE is not None
+
+
+def clear_xla_device_cache():
+    global _XLA_DEVICE_CACHE
+    _XLA_DEVICE_CACHE = None
+    return None
 
 
 def setup_distributed_cuda():
@@ -127,7 +132,7 @@ def setup_distributed_cuda():
 def setup_distributed_xla():
     if not _HAS_XLA:
         raise RuntimeError("torch_xla is not available")
-    device = xm.xla_device()
+    device = get_xla_device()
     local_rank = xm.get_local_ordinal()
     world_size = xr.world_size()
     return local_rank, world_size, device
