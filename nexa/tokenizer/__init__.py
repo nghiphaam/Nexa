@@ -10,6 +10,11 @@ from nexa.tokenizer.tokenizer import (
     USR_TOKEN,
     AST_TOKEN,
 )
+from nexa.tokenizer.multimodal_tokenizer import (
+    IMAGE_START_TOKEN,
+    IMAGE_END_TOKEN,
+    add_multimodal_tokens,
+)
 
 __all__ = [
     "NexaTokenizer",
@@ -21,4 +26,7 @@ __all__ = [
     "SYS_TOKEN",
     "USR_TOKEN",
     "AST_TOKEN",
+    "IMAGE_START_TOKEN",
+    "IMAGE_END_TOKEN",
+    "add_multimodal_tokens",
 ]
