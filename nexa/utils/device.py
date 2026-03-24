@@ -15,6 +15,9 @@ except Exception:
     xr = None
     _HAS_XLA = False
 
+# Cache XLA device to avoid multiple initialization attempts
+_XLA_DEVICE_CACHE = None
+
 
 def is_rocm():
     """Check if running on AMD ROCm."""
@@ -65,10 +68,14 @@ def safe_cuda_alloc(device_id=0):
 
 def safe_xla_alloc():
     """Test if XLA/TPU device can allocate memory safely."""
+    global _XLA_DEVICE_CACHE
     if not _HAS_XLA:
         return False
     try:
-        device = xm.xla_device()
+        # Use cached device if available
+        if _XLA_DEVICE_CACHE is None:
+            _XLA_DEVICE_CACHE = xm.xla_device()
+        device = _XLA_DEVICE_CACHE
         # Test with smaller allocation - TPU initialization can be slow
         test = torch.zeros((10, 10), device=device)
         xm.mark_step()  # Force synchronization
@@ -82,9 +89,13 @@ def safe_xla_alloc():
 
 
 def get_xla_device():
+    global _XLA_DEVICE_CACHE
     if not _HAS_XLA:
         raise RuntimeError("torch_xla is not available")
-    return xm.xla_device()
+    # Return cached device to avoid re-initialization
+    if _XLA_DEVICE_CACHE is None:
+        _XLA_DEVICE_CACHE = xm.xla_device()
+    return _XLA_DEVICE_CACHE
 
 
 def setup_distributed_cuda():
