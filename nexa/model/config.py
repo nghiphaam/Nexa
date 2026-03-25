@@ -1,7 +1,5 @@
 """Config dataclass for Nexa model."""
-import math
 from dataclasses import dataclass
-import torch
 
 
 @dataclass
@@ -11,7 +9,7 @@ class Config:
 
     # Model - NEXA 1.2: Scaled to 1B parameters
     vocab_size: int = 50261
-    eos_id: int = None
+    eos_id: int | None = None
     block_size: int = 2048
     sliding_window: int = 2048
     n_embd: int = 2048

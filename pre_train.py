@@ -2,8 +2,7 @@ import json
 import math
 import os
 import random
-import subprocess
-import sys
+import importlib
 import time
 from itertools import islice
 
@@ -20,19 +19,19 @@ USR_TOKEN = "<|user|>"
 AST_TOKEN = "<|assistant|>"
 
 
-def ensure_pkg(name, pip_name=None):
+def require_pkg(name, pip_name=None):
     try:
-        __import__(name)
-    except ImportError:
-        print(f"Installing {pip_name or name}...")
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "-q", pip_name or name]
-        )
+        importlib.import_module(name)
+    except ImportError as exc:
+        package = pip_name or name
+        raise RuntimeError(
+            f"Missing required dependency '{package}'. Install it before running pre_train.py."
+        ) from exc
 
 
-ensure_pkg("datasets")
-ensure_pkg("huggingface_hub")
-ensure_pkg("tiktoken")
+require_pkg("datasets")
+require_pkg("huggingface_hub")
+require_pkg("tiktoken")
 
 
 class NexaTokenizer:
@@ -169,8 +168,6 @@ def stream_tokenize_to_bins(
     flush_tokens: int = 5_000_000,
     val_ratio: float = 0.01,
 ):
-    from multiprocessing import Pool, cpu_count
-
     t0 = time.time()
     train_buffer = []
     val_buffer = []
@@ -285,11 +282,8 @@ def tokenize_dataset_in_memory(
     )
 
     def fast_tokenize(ds, out_path):
-        from multiprocessing import Pool, cpu_count
-
         t0 = time.time()
         chunk_size = max(5000, min(500000, int(max(1.0, ram_gb) * 50000)))
-        n_workers = max(1, cpu_count() - 1)
 
         def tokenize_chunk(texts):
             encodings = tokenizer.encode_batch(texts)

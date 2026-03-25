@@ -61,8 +61,10 @@ def train(config: Config):
     tokenizer = load_tokenizer()
     config.vocab_size = tokenizer.get_vocab_size()
     config.eos_id = tokenizer.token_to_id(EOS_TOKEN)
+
+    if is_main_process:
         print("=" * 65)
-        print("  Nexa 1.3  (~1B, Multi-GPU/TPU)")
+        print("  Nexa 1.5  (~1B, Multi-GPU/TPU)")
         print("=" * 65)
         print(f"\nDevice       : {device}")
         print(f"World size   : {world_size}")
