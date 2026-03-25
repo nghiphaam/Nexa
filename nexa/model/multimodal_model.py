@@ -146,7 +146,7 @@ class MultimodalModel(nn.Module):
             **kwargs: Sampling parameters (temperature, top_k, top_p, etc.)
 
         Returns:
-            Generated token ids (B, T + max_new_tokens)
+            Generated token ids (B, max_new_tokens)
         """
         if images is None:
             return self.text_model.generate(input_ids, max_new_tokens, **kwargs)

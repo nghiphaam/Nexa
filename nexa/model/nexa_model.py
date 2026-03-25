@@ -326,7 +326,8 @@ class NexaModel(nn.Module):
                 seen_mask[idx_next.squeeze().clamp(0, self.config.vocab_size - 1)] = True
             current_len += 1
 
-            eos_id = getattr(self.config, "eos_id", -1)
+            eos_id = getattr(self.config, "eos_id", None)
+            eos_id = -1 if eos_id is None else int(eos_id)
             while current_len < T + max_new_tokens:
                 if eos_id >= 0 and (idx_next.squeeze(-1) == eos_id).all():
                     break
@@ -436,7 +437,8 @@ class NexaModel(nn.Module):
             if init_ids.numel() > 0:
                 seen_mask[init_ids.unique()] = True
 
-            eos_id = getattr(self.config, "eos_id", -1)
+            eos_id = getattr(self.config, "eos_id", None)
+            eos_id = -1 if eos_id is None else int(eos_id)
             current_len = T
             for _ in range(max_new_tokens):
                 idx_next = self._sample_token(
