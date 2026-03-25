@@ -1,4 +1,6 @@
-"""Multimodal model: NexaModel + vision support."""
+"""Multimodal model for Nexa 1.6: language backbone + vision fusion."""
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,28 +12,37 @@ from nexa.vision import (
     ImageDropout,
     SpatialPatchSelector,
     ImageProcessor,
+    CrossModalAttentionFusion,
 )
 
 
 class MultimodalModel(nn.Module):
-    def __init__(self, config, vision_model_name="google/siglip-base-patch16-224", num_image_tokens=64):
+    """Language model with image encoding and cross-modal attention fusion."""
+
+    def __init__(self, config, vision_model_name=None, num_image_tokens=None):
         super().__init__()
         self.config = config
-        self.num_image_tokens = num_image_tokens
+        self.num_image_tokens = num_image_tokens or getattr(config, "num_image_tokens", 64)
+        vision_model_name = vision_model_name or getattr(config, "vision_model_name", "google/siglip-base-patch16-224")
 
-        self.text_model = NexaModel(config)
-
+        self.text_model = NexaModel(config, use_grad_ckpt=getattr(config, "use_grad_ckpt", False))
         self.vision_encoder = VisionEncoder(vision_model_name)
-        self.patch_selector = SpatialPatchSelector(num_image_tokens)
+        self.patch_selector = SpatialPatchSelector(self.num_image_tokens)
         self.projector = VisionProjector(
             vision_dim=self.vision_encoder.hidden_size,
             n_embd=config.n_embd,
-            num_tokens=num_image_tokens,
+            num_tokens=self.num_image_tokens,
+        )
+        self.cross_modal_fusion = CrossModalAttentionFusion(
+            n_embd=config.n_embd,
+            n_head=getattr(config, "cross_modal_heads", 8),
+            hidden_size=getattr(config, "multimodal_hidden_size", config.n_embd),
+            n_layer=getattr(config, "cross_modal_layers", 2),
+            dropout=getattr(config, "multimodal_dropout", config.dropout),
         )
         self.gate = ImageTextGate(config.n_embd)
         self.image_dropout = ImageDropout(config.n_embd)
         self.image_processor = ImageProcessor(vision_model_name)
-
         self.image_start_id = None
         self.image_end_id = None
 
@@ -39,52 +50,73 @@ class MultimodalModel(nn.Module):
         self.image_start_id = image_start_id
         self.image_end_id = image_end_id
 
-    def encode_image(self, images, training=False):
-        """Encode images into pseudo text tokens."""
-        if isinstance(images, str) or not isinstance(images, torch.Tensor):
-            images = self.image_processor(images)
+    def _match_image_batch(self, image_tokens, batch_size: int):
+        if image_tokens.size(0) == batch_size:
+            return image_tokens
+        if image_tokens.size(0) == 1 and batch_size > 1:
+            return image_tokens.repeat(batch_size, 1, 1)
+        raise ValueError(
+            f"Image batch size ({image_tokens.size(0)}) must match text batch size ({batch_size}) or be 1"
+        )
 
-        if images.dim() == 3:
-            images = images.unsqueeze(0)
+    def encode_image(self, images, training: bool = False):
+        """Encode images into fused pseudo-token representations."""
+        if images is None:
+            raise ValueError("images must not be None when calling encode_image()")
 
-        features = self.vision_encoder(images)
+        if isinstance(images, (list, tuple)):
+            processed = self.image_processor.batch_process(images)
+        elif isinstance(images, str) or not isinstance(images, torch.Tensor):
+            processed = self.image_processor(images)
+        else:
+            processed = images
 
+        if processed.dim() == 3:
+            processed = processed.unsqueeze(0)
+
+        device = next(self.parameters()).device
+        processed = processed.to(device=device)
+        features = self.vision_encoder(processed)
         features = self.patch_selector(features)
-
         image_tokens = self.projector(features)
-
         image_tokens, gate_alpha = self.gate(image_tokens)
-
         image_tokens = self.image_dropout(image_tokens, training=training)
-
         return image_tokens, gate_alpha
 
     def forward(self, input_ids=None, labels=None, images=None, **kwargs):
-        """
-        Forward pass.
+        """Run a multimodal forward pass.
 
-        If images provided, prepend image pseudo tokens to text embeddings.
+        Args:
+            input_ids: token ids with shape (B, T)
+            labels: optional language modeling labels
+            images: optional image batch or image paths
+
+        Returns:
+            dict with logits, loss, and intermediate multimodal features.
         """
+        if input_ids is None:
+            raise ValueError("input_ids must be provided")
+
         if images is None:
             logits, loss = self.text_model(input_ids, labels)
             return {
                 "logits": logits,
                 "loss": loss,
                 "image_features": None,
-                "text_features": None,
+                "text_features": self.text_model.transformer.wte(input_ids),
                 "gate_alpha": None,
             }
 
         image_tokens, gate_alpha = self.encode_image(images, training=self.training)
-
+        image_tokens = self._match_image_batch(image_tokens, input_ids.size(0))
         text_emb = self.text_model.transformer.wte(input_ids)
-
+        text_emb, image_tokens = self.cross_modal_fusion(text_emb, image_tokens)
         x = torch.cat([image_tokens, text_emb], dim=1)
 
         if labels is not None:
-            B = labels.size(0)
+            batch_size = labels.size(0)
             ignore_labels = torch.full(
-                (B, self.num_image_tokens),
+                (batch_size, image_tokens.size(1)),
                 -100,
                 device=labels.device,
                 dtype=labels.dtype,
@@ -94,7 +126,6 @@ class MultimodalModel(nn.Module):
             full_labels = None
 
         logits, loss = self._forward_with_embeddings(x, full_labels)
-
         return {
             "logits": logits,
             "loss": loss,
@@ -104,18 +135,15 @@ class MultimodalModel(nn.Module):
         }
 
     def _forward_with_embeddings(self, x, labels=None):
-        """Forward pass using pre-computed embeddings."""
-        B, T, C = x.size()
-
-        if T > self.config.block_size:
-            x = x[:, :self.config.block_size, :]
-            T = self.config.block_size
+        batch_size, seq_len, _ = x.size()
+        if seq_len > self.config.block_size:
+            x = x[:, : self.config.block_size, :]
+            seq_len = self.config.block_size
             if labels is not None:
-                labels = labels[:, :self.config.block_size]
+                labels = labels[:, : self.config.block_size]
 
         x = self.text_model.transformer.drop(x)
-
-        pos = torch.arange(0, T, device=x.device)
+        pos = torch.arange(0, seq_len, device=x.device)
         freqs_cos = self.text_model.freqs_cos[pos]
         freqs_sin = self.text_model.freqs_sin[pos]
 
@@ -132,127 +160,202 @@ class MultimodalModel(nn.Module):
                 labels.view(-1),
                 ignore_index=-100,
             )
-
         return logits, loss
 
-    @torch.no_grad()
-    def generate(self, input_ids, images=None, max_new_tokens=100, **kwargs):
-        """Generate text with optional image.
+    def _build_generation_embeddings(self, input_ids: torch.Tensor, images):
+        image_tokens, gate_alpha = self.encode_image(images, training=False)
+        image_tokens = self._match_image_batch(image_tokens, input_ids.size(0))
+        text_emb = self.text_model.transformer.wte(input_ids)
+        fused_text, fused_image = self.cross_modal_fusion(text_emb, image_tokens)
 
-        Args:
-            input_ids: (B, T) token ids, may contain <image_start> and <image_end> markers
-            images: Optional images (B, C, H, W) or list of PIL images
-            max_new_tokens: Number of tokens to generate
-            **kwargs: Sampling parameters (temperature, top_k, top_p, etc.)
+        full_embeddings = []
+        for batch_idx in range(input_ids.size(0)):
+            seq = input_ids[batch_idx]
+            text_row = fused_text[batch_idx]
+            image_row = fused_image[batch_idx]
 
-        Returns:
-            Generated token ids (B, max_new_tokens)
-        """
-        if images is None:
-            return self.text_model.generate(input_ids, max_new_tokens, **kwargs)
-
-        image_tokens, _ = self.encode_image(images, training=False)
-        B = image_tokens.size(0)
-
-        text_emb = self.text_model.transformer.wte(input_ids)  # (B, T, n_embd)
-
-        if self.image_start_id is None or self.image_end_id is None:
-            raise ValueError("Image token IDs not set. Call set_image_token_ids() first.")
-
-        full_emb = []
-        for b in range(B):
-            seq = input_ids[b]
-            emb = text_emb[b]
-
-            start_pos = (seq == self.image_start_id).nonzero(as_tuple=True)[0]
-            end_pos = (seq == self.image_end_id).nonzero(as_tuple=True)[0]
-
-            if len(start_pos) > 0 and len(end_pos) > 0:
-                start_idx = start_pos[0].item()
-                end_idx = end_pos[0].item()
-
-                before = emb[:start_idx]
-                after = emb[end_idx + 1:]
-                img_emb = image_tokens[b]
-
-                img_emb, _ = self.gate(img_emb)
-
-                seq_emb = torch.cat([before, img_emb, after], dim=0)
+            if self.image_start_id is not None and self.image_end_id is not None:
+                start_pos = (seq == self.image_start_id).nonzero(as_tuple=True)[0]
+                end_pos = (seq == self.image_end_id).nonzero(as_tuple=True)[0]
+                if len(start_pos) > 0 and len(end_pos) > 0 and start_pos[0].item() < end_pos[0].item():
+                    start_idx = start_pos[0].item()
+                    end_idx = end_pos[0].item()
+                    seq_emb = torch.cat([text_row[:start_idx], image_row, text_row[end_idx + 1 :]], dim=0)
+                else:
+                    seq_emb = torch.cat([image_row, text_row], dim=0)
             else:
-                seq_emb = emb
+                seq_emb = torch.cat([image_row, text_row], dim=0)
+            full_embeddings.append(seq_emb)
 
-            full_emb.append(seq_emb)
-
-        max_len = max(e.size(0) for e in full_emb)
-        padded_emb = []
-        for emb in full_emb:
+        max_len = max(emb.size(0) for emb in full_embeddings)
+        padded = []
+        for emb in full_embeddings:
             if emb.size(0) < max_len:
                 pad = torch.zeros(max_len - emb.size(0), emb.size(1), device=emb.device, dtype=emb.dtype)
                 emb = torch.cat([emb, pad], dim=0)
-            padded_emb.append(emb)
+            padded.append(emb)
+        return torch.stack(padded, dim=0), gate_alpha
 
-        x = torch.stack(padded_emb, dim=0)  # (B, T', n_embd)
+    @torch.no_grad()
+    def generate(self, input_ids, images=None, max_new_tokens=None, **kwargs):
+        """Generate tokens or text with optional images.
 
-        generated = []
+        Set return_dict=True and pass tokenizer=... to receive both token ids and decoded text.
+        """
+        if images is None:
+            return self.text_model.generate(input_ids, max_new_tokens=max_new_tokens, **kwargs)
+
+        tokenizer = kwargs.get("tokenizer")
+        return_dict = bool(kwargs.get("return_dict", False))
+        include_prompt = bool(kwargs.get("include_prompt", True))
+        temperature = kwargs.get("temperature", getattr(self.config, "temperature", 0.8))
+        top_k = kwargs.get("top_k", getattr(self.config, "top_k", 50))
+        top_p = kwargs.get("top_p", getattr(self.config, "top_p", 0.9))
+        min_p = kwargs.get("min_p", getattr(self.config, "min_p", 0.05))
+        repetition_penalty = kwargs.get("repetition_penalty", getattr(self.config, "repetition_penalty", 1.1))
+        eos_id = kwargs.get("eos_id", getattr(self.config, "eos_id", None))
+        max_new_tokens = int(max_new_tokens or getattr(self.config, "gen_len", 200))
+
+        token_history, prompt_lengths = self.text_model._prepare_generation_inputs(input_ids, tokenizer=tokenizer)
+        prompt_embeddings, _ = self._build_generation_embeddings(token_history, images)
+        batch_size = token_history.size(0)
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=token_history.device)
+        eos_enabled = eos_id is not None
+
         for _ in range(max_new_tokens):
-            T = x.size(1)
-            if T > self.config.block_size:
-                x_input = x[:, -self.config.block_size:]
-                T = self.config.block_size
-            else:
-                x_input = x
-
-            pos = torch.arange(0, T, device=x.device)
+            x_input = prompt_embeddings[:, -self.config.block_size :]
+            seq_len = x_input.size(1)
+            pos = torch.arange(0, seq_len, device=x_input.device)
             freqs_cos = self.text_model.freqs_cos[pos]
             freqs_sin = self.text_model.freqs_sin[pos]
 
-            h = self.text_model.transformer.drop(x_input)
+            hidden = self.text_model.transformer.drop(x_input)
             for block in self.text_model.transformer.h:
-                h, _ = block(h, freqs_cos, freqs_sin, kv_cache=None)
-            h = self.text_model.transformer.ln_f(h)
-            logits = self.text_model.lm_head(h)  # (B, T, vocab_size)
+                hidden, _ = block(hidden, freqs_cos, freqs_sin, kv_cache=None)
+            hidden = self.text_model.transformer.ln_f(hidden)
+            logits = self.text_model.lm_head(hidden)[:, -1, :]
+            next_token = self.text_model._sample_token(
+                logits,
+                token_history,
+                temperature,
+                top_k,
+                top_p,
+                min_p,
+                repetition_penalty,
+            )
 
-            next_token_logits = logits[:, -1, :]  # (B, vocab_size)
+            if eos_enabled and finished.any():
+                next_token = next_token.clone()
+                next_token[finished] = int(eos_id)
 
-            temperature = kwargs.get('temperature', 0.8)
-            top_k = kwargs.get('top_k', 50)
-            top_p = kwargs.get('top_p', 0.9)
-            min_p = kwargs.get('min_p', 0.05)
+            token_history = torch.cat([token_history, next_token], dim=1)
+            next_emb = self.text_model.transformer.wte(next_token)
+            prompt_embeddings = torch.cat([prompt_embeddings, next_emb], dim=1)
 
-            next_token_logits = next_token_logits / temperature
+            if eos_enabled:
+                finished = finished | (next_token.squeeze(-1) == int(eos_id))
+                if finished.all():
+                    break
 
-            if top_k > 0:
-                indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
-                next_token_logits[indices_to_remove] = float('-inf')
+        return self.text_model._build_generation_output(
+            token_history,
+            prompt_lengths,
+            tokenizer=tokenizer,
+            return_dict=return_dict,
+            include_prompt=include_prompt,
+        )
 
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                sorted_indices_to_remove[..., 0] = 0
-                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                next_token_logits[indices_to_remove] = float('-inf')
+    @torch.no_grad()
+    def generate_stream(self, input_ids, images=None, max_new_tokens=None, **kwargs):
+        """Stream multimodal generation.
 
-            if min_p > 0.0:
-                probs = F.softmax(next_token_logits, dim=-1)
-                max_prob = probs.max(dim=-1, keepdim=True)[0]
-                indices_to_remove = probs < (min_p * max_prob)
-                next_token_logits[indices_to_remove] = float('-inf')
+        For batched multimodal inputs, falls back to batched generation and emits step-wise events.
+        """
+        if images is None:
+            yield from self.text_model.generate_stream(input_ids, max_new_tokens=max_new_tokens, **kwargs)
+            return
 
-            probs = F.softmax(next_token_logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
+        tokenizer = kwargs.get("tokenizer")
+        return_dict = bool(kwargs.get("return_dict", False))
+        temperature = kwargs.get("temperature", getattr(self.config, "temperature", 0.8))
+        top_k = kwargs.get("top_k", getattr(self.config, "top_k", 50))
+        top_p = kwargs.get("top_p", getattr(self.config, "top_p", 0.9))
+        min_p = kwargs.get("min_p", getattr(self.config, "min_p", 0.05))
+        repetition_penalty = kwargs.get("repetition_penalty", getattr(self.config, "repetition_penalty", 1.1))
+        eos_id = kwargs.get("eos_id", getattr(self.config, "eos_id", None))
+        max_new_tokens = int(max_new_tokens or getattr(self.config, "gen_len", 200))
 
-            generated.append(next_token)
+        token_history, prompt_lengths = self.text_model._prepare_generation_inputs(input_ids, tokenizer=tokenizer)
+        if token_history.size(0) > 1:
+            out = self.generate(
+                token_history,
+                images=images,
+                max_new_tokens=max_new_tokens,
+                tokenizer=tokenizer,
+                return_dict=True,
+                include_prompt=True,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                eos_id=eos_id,
+            )
+            generated_rows = out["generated_token_ids"]
+            max_steps = max((len(row) for row in generated_rows), default=0)
+            for step in range(max_steps):
+                token_ids = [row[step] if step < len(row) else None for row in generated_rows]
+                if return_dict:
+                    texts = []
+                    if tokenizer is not None:
+                        texts = ["" if token_id is None else tokenizer.decode([token_id]) for token_id in token_ids]
+                    yield {
+                        "step": step,
+                        "token_ids": token_ids,
+                        "texts": texts,
+                        "finished": [token_id is None or (eos_id is not None and token_id == eos_id) for token_id in token_ids],
+                    }
+                else:
+                    yield token_ids
+            return
 
-            next_emb = self.text_model.transformer.wte(next_token)  # (B, 1, n_embd)
-            x = torch.cat([x, next_emb], dim=1)
+        prompt_embeddings, _ = self._build_generation_embeddings(token_history, images)
+        finished = False
+        for step in range(max_new_tokens):
+            x_input = prompt_embeddings[:, -self.config.block_size :]
+            seq_len = x_input.size(1)
+            pos = torch.arange(0, seq_len, device=x_input.device)
+            freqs_cos = self.text_model.freqs_cos[pos]
+            freqs_sin = self.text_model.freqs_sin[pos]
 
-            if self.config.eos_id is not None and (next_token == self.config.eos_id).all():
+            hidden = self.text_model.transformer.drop(x_input)
+            for block in self.text_model.transformer.h:
+                hidden, _ = block(hidden, freqs_cos, freqs_sin, kv_cache=None)
+            hidden = self.text_model.transformer.ln_f(hidden)
+            logits = self.text_model.lm_head(hidden)[:, -1, :]
+            next_token = self.text_model._sample_token(
+                logits,
+                token_history,
+                temperature,
+                top_k,
+                top_p,
+                min_p,
+                repetition_penalty,
+            )
+            token_id = int(next_token.item())
+            token_history = torch.cat([token_history, next_token], dim=1)
+            next_emb = self.text_model.transformer.wte(next_token)
+            prompt_embeddings = torch.cat([prompt_embeddings, next_emb], dim=1)
+            if eos_id is not None and token_id == int(eos_id):
+                finished = True
+            if return_dict:
+                yield {
+                    "step": step,
+                    "token_id": token_id,
+                    "text": "" if tokenizer is None else tokenizer.decode([token_id]),
+                    "finished": finished,
+                }
+            else:
+                yield token_id
+            if finished:
                 break
-
-        if generated:
-            generated_ids = torch.cat(generated, dim=1)  # (B, max_new_tokens)
-            return generated_ids
-        else:
-            return torch.empty(B, 0, dtype=torch.long, device=input_ids.device)

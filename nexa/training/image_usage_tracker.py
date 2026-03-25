@@ -11,7 +11,7 @@ class ImageUsageTracker:
         """
         Heuristic image usage score.
         Full attention tracking requires model changes to expose attentions.
-        For v1.5, use gate alpha as proxy.
+        For v1.6, use gate alpha as proxy.
         """
         model_unwrapped = model.module if hasattr(model, 'module') else model
 

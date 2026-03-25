@@ -20,7 +20,7 @@ Nexa is a compact transformer codebase for text generation, distributed training
 - Base tokenizer exports in [nexa/tokenizer/__init__.py](nexa/tokenizer/__init__.py)
 - Multimodal special-token helpers in [nexa/tokenizer/multimodal_tokenizer.py](nexa/tokenizer/multimodal_tokenizer.py)
 
-### Multimodal image understanding (Nexa 1.5)
+### Multimodal image understanding (Nexa 1.6)
 - `MultimodalModel` in [nexa/model/multimodal_model.py](nexa/model/multimodal_model.py)
 - Frozen SigLIP vision encoder in [nexa/vision/vision_encoder.py](nexa/vision/vision_encoder.py)
 - Vision projector, image-text gate, image dropout, patch selection in [nexa/vision/](nexa/vision/)

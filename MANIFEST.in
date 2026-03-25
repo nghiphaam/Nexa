@@ -1,0 +1,4 @@
+include README.md
+include LICENSE
+recursive-include nexa/assets *
+recursive-include nexa/vision *.py

@@ -11,20 +11,26 @@ class CollapseDetector:
         self.writer = writer
         self.step = 0
 
+    def _extract_token_tensor(self, output):
+        if isinstance(output, dict):
+            token_ids = output.get("token_ids")
+            if token_ids is None:
+                rows = output.get("generated_token_ids", [])
+                if rows:
+                    token_ids = torch.tensor(rows, device=next(self.model.parameters()).device)
+            return token_ids
+        return output
+
     @torch.no_grad()
     def test_image_usage(self, image, prompt):
         """Test if model actually uses image."""
-        # With image
         prompt_ids = torch.tensor([self.tokenizer.encode(prompt).ids], device=next(self.model.parameters()).device)
         out1 = self.model.generate(input_ids=prompt_ids, images=image, max_new_tokens=50)
-
-        # Without image
         out2 = self.model.generate(input_ids=prompt_ids, images=None, max_new_tokens=50)
-
-        # Get embeddings
+        out1 = self._extract_token_tensor(out1)
+        out2 = self._extract_token_tensor(out2)
         emb1 = self._get_sentence_embedding(out1)
         emb2 = self._get_sentence_embedding(out2)
-
         similarity = F.cosine_similarity(emb1, emb2, dim=0).item()
 
         if self.writer is not None:
@@ -58,11 +64,6 @@ class CollapseEarlyStopping:
     def check(self, similarity):
         is_collapse = similarity > self.threshold
         self.collapse_history.append(is_collapse)
-
         if len(self.collapse_history) > self.patience:
             self.collapse_history.pop(0)
-
-        if len(self.collapse_history) == self.patience and all(self.collapse_history):
-            return True
-
-        return False
+        return len(self.collapse_history) == self.patience and all(self.collapse_history)

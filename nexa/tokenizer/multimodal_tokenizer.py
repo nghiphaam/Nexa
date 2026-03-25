@@ -1,37 +1,31 @@
 """Multimodal tokenizer utilities."""
-import torch
+from __future__ import annotations
 
+import torch
 
 IMAGE_START_TOKEN = "<image>"
 IMAGE_END_TOKEN = "</image>"
 
 
 def add_multimodal_tokens(tokenizer, model=None):
-    """
-    Add multimodal special tokens.
-
-    For NexaTokenizer, token addition is not dynamic, so this helper only returns ids
-    if the tokenizer already supports them. If a model is provided and exposes embeddings,
-    initialize any newly added rows.
-    """
+    """Add multimodal tokens and optionally resize model embeddings."""
     special_tokens = [IMAGE_START_TOKEN, IMAGE_END_TOKEN]
 
-    if hasattr(tokenizer, 'special_map'):
-        # Extend custom tokenizer maps if missing
+    if hasattr(tokenizer, "special_map"):
         next_id = max(tokenizer.special_map.values()) + 1
         for token in special_tokens:
             if token not in tokenizer.special_map:
                 tokenizer.special_map[token] = next_id
                 tokenizer.id_to_special[next_id] = token
                 next_id += 1
-        if hasattr(tokenizer, '_vocab_size'):
+        if hasattr(tokenizer, "_vocab_size"):
             tokenizer._vocab_size = max(tokenizer._vocab_size, next_id)
 
-    if model is not None and hasattr(model, 'text_model'):
+    if model is not None and hasattr(model, "text_model"):
         emb = model.text_model.transformer.wte
         lm_head = model.text_model.lm_head
         current_vocab = emb.weight.size(0)
-        new_vocab = getattr(tokenizer, '_vocab_size', current_vocab)
+        new_vocab = getattr(tokenizer, "_vocab_size", current_vocab)
 
         if new_vocab > current_vocab:
             old_weight = emb.weight.data

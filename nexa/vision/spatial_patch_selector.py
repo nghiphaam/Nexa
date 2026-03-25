@@ -21,7 +21,7 @@ class SpatialPatchSelector(nn.Module):
             indices = indices.unsqueeze(-1).expand(-1, -1, D)
             selected = torch.gather(features, 1, indices)
         else:
-            # Simple adaptive pooling for v1.5
+            # Simple adaptive pooling for v1.6
             selected = F.adaptive_avg_pool1d(
                 features.transpose(1, 2),
                 self.num_tokens

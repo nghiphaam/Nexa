@@ -1,4 +1,4 @@
-"""Main training loop for Nexa model with multi-GPU and TPU support."""
+"""Main training loop for Nexa 1.6 with multi-GPU and TPU support."""
 import os
 import time
 import math
@@ -64,7 +64,7 @@ def train(config: Config):
 
     if is_main_process:
         print("=" * 65)
-        print("  Nexa 1.5  (~1B, Multi-GPU/TPU)")
+        print("  Nexa 1.6  (~1B, Multi-GPU/TPU)")
         print("=" * 65)
         print(f"\nDevice       : {device}")
         print(f"World size   : {world_size}")
