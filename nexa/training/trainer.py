@@ -3,6 +3,7 @@ import os
 import time
 import math
 import random
+import contextlib
 import numpy as np
 import torch
 from nexa.model.config import Config
@@ -31,7 +32,6 @@ from nexa.training.auto_config import auto_config
 
 
 def train(config: Config):
-    # Setup distributed training if needed
     local_rank = 0
     world_size = 1
     is_main_process = True
@@ -43,7 +43,6 @@ def train(config: Config):
         local_rank, world_size, config.device = setup_distributed_cuda()
         is_main_process = (local_rank == 0)
 
-    # Set seeds
     random.seed(config.seed + local_rank)
     np.random.seed(config.seed + local_rank)
     torch.manual_seed(config.seed + local_rank)
@@ -62,8 +61,6 @@ def train(config: Config):
     tokenizer = load_tokenizer()
     config.vocab_size = tokenizer.get_vocab_size()
     config.eos_id = tokenizer.token_to_id(EOS_TOKEN)
-
-    if is_main_process:
         print("=" * 65)
         print("  Nexa 1.3  (~1B, Multi-GPU/TPU)")
         print("=" * 65)
@@ -82,7 +79,6 @@ def train(config: Config):
         elif is_xla_device(device):
             print("Accelerator  : TPU/XLA")
 
-    # Data
     train_path = os.path.join(config.data_dir, "train.bin")
     val_path = os.path.join(config.data_dir, "val.bin")
 
@@ -109,10 +105,8 @@ def train(config: Config):
 
     model = NexaModel(config).to(device)
 
-    # Wrap model for distributed training
     if world_size > 1:
         if is_xla_device(device):
-            # XLA handles distribution automatically
             pass
         elif is_distributed():
             model = torch.nn.parallel.DistributedDataParallel(
@@ -122,7 +116,6 @@ def train(config: Config):
                 find_unused_parameters=False,
             )
 
-    # Resume from checkpoint if exists
     resume_iter = 0
     ckpt_path = os.path.join(config.checkpoint_dir, "best.pt")
     if os.path.exists(ckpt_path):
@@ -131,7 +124,6 @@ def train(config: Config):
         map_location = device if not is_xla_device(device) else "cpu"
         ckpt = torch.load(ckpt_path, map_location=map_location, weights_only=False)
 
-        # Load into base model if wrapped in DDP
         model_to_load = model.module if hasattr(model, "module") else model
         safe_load_model_state(model_to_load, ckpt["model"], label="resume checkpoint")
         resume_iter = ckpt.get("iter", 0)
@@ -148,7 +140,6 @@ def train(config: Config):
             if is_main_process:
                 print(f"[warn] torch.compile failed: {e}. Falling back to eager mode.")
 
-    # Optimizer
     optimizer, fused_str = configure_optimizer(model, config, device)
 
     if resume_iter > 0 and "optimizer" in ckpt:
@@ -169,7 +160,6 @@ def train(config: Config):
             f"LR schedule  : warmup({config.warmup_iters}) -> cosine -> floor({config.min_lr})"
         )
 
-    # AMP
     use_amp = is_cuda_device(device)
     dtype_obj = getattr(torch, config.dtype, torch.float32)
     amp_ctx = make_amp_context(device, dtype_obj) if use_amp else contextlib.nullcontext()
@@ -203,7 +193,6 @@ def train(config: Config):
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
-        # Eval (only on main process)
         if (it % config.eval_interval == 0 or it == config.max_iters) and is_main_process:
             losses = estimate_loss(model, train_data, val_data, config, amp_ctx)
             elapsed = time.time() - t0
@@ -221,7 +210,6 @@ def train(config: Config):
                 best_val = losses["val"]
                 os.makedirs(config.checkpoint_dir, exist_ok=True)
 
-                # Save base model if wrapped in DDP
                 model_to_save = model.module if hasattr(model, "module") else model
                 ckpt_data = {
                     "model": model_to_save.state_dict(),
@@ -241,7 +229,6 @@ def train(config: Config):
                 torch.save(ckpt_data, os.path.join(config.checkpoint_dir, "best.pt"))
                 print(f"  ** best model saved (val={best_val:.4f})")
 
-            # Broadcast best_val to all processes to keep them in sync
             if world_size > 1 and is_distributed():
                 best_val_tensor = torch.tensor([best_val], device=device)
                 torch.distributed.broadcast(best_val_tensor, src=0)
@@ -252,14 +239,12 @@ def train(config: Config):
             )
             print(f"  >> {sample[:200]}...\n")
 
-        # Sync before training step
         if world_size > 1:
             barrier()
 
         if it == config.max_iters:
             break
 
-        # Training step
         accum_loss = 0.0
         skip_step = False
         optimizer.zero_grad(set_to_none=True)
@@ -273,8 +258,17 @@ def train(config: Config):
 
             if not torch.isfinite(loss):
                 if is_main_process:
-                    print(f"\n[warn] NaN loss at step={it}. Skipping optimizer step.")
+                    print(f"\n[warn] NaN loss at step={it}. Resetting optimizer state.")
                 optimizer.zero_grad(set_to_none=True)
+                for group in optimizer.param_groups:
+                    for p in group['params']:
+                        if p.grad is not None:
+                            p.grad = None
+                        state = optimizer.state.get(p, {})
+                        if 'exp_avg' in state:
+                            state['exp_avg'].zero_()
+                        if 'exp_avg_sq' in state:
+                            state['exp_avg_sq'].zero_()
                 skip_step = True
                 break
 
@@ -285,15 +279,12 @@ def train(config: Config):
 
             accum_loss += loss.item()
 
-        # Synchronize gradients across processes before optimizer step
         if world_size > 1 and is_distributed():
             barrier()
 
-        # Gradient clipping and optimizer step
         norm = -1.0
 
         if not skip_step:
-            # XLA/TPU path
             if is_xla_device(device):
                 if config.grad_clip > 0:
                     norm = torch.nn.utils.clip_grad_norm_(
@@ -302,7 +293,6 @@ def train(config: Config):
                 import torch_xla.core.xla_model as xm
                 xm.optimizer_step(optimizer, barrier=False)
                 xm.mark_step()
-            # CUDA/ROCm with AMP
             elif scaler is not None:
                 if config.grad_clip > 0:
                     scaler.unscale_(optimizer)
@@ -311,7 +301,6 @@ def train(config: Config):
                     ).item()
                 scaler.step(optimizer)
                 scaler.update()
-            # CPU or CUDA without AMP
             else:
                 if config.grad_clip > 0:
                     norm = torch.nn.utils.clip_grad_norm_(
@@ -321,7 +310,6 @@ def train(config: Config):
 
         optimizer.zero_grad(set_to_none=True)
 
-        # Periodic logging
         if it > 0 and it % config.log_interval == 0 and is_main_process:
             elapsed = time.time() - t0
             tps = (it * tok_per_step) / elapsed
@@ -347,6 +335,3 @@ def train(config: Config):
         print(f"  DONE in {total:.0f}s ({total / 60:.1f}min)")
         print(f"  Best val loss: {best_val:.4f} | PPL: {math.exp(min(best_val, 20)):.2f}")
         print(f"{'\u2500' * 65}")
-
-
-import contextlib

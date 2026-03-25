@@ -9,13 +9,12 @@ try:
     import torch_xla.core.xla_model as xm
     import torch_xla.runtime as xr
     _HAS_XLA = True
-except Exception:
+except (ImportError, RuntimeError):
     torch_xla = None
     xm = None
     xr = None
     _HAS_XLA = False
 
-# Cache XLA device to avoid multiple initialization attempts
 _XLA_DEVICE_CACHE = None
 
 
@@ -56,7 +55,6 @@ def safe_cuda_alloc(device_id=0):
             if free < 100 * 1024 * 1024:
                 return False
         except Exception:
-            # ROCm might not support mem_get_info, skip check
             pass
         test = torch.empty((1, 1024, 1024), device=f"cuda:{device_id}", dtype=torch.float32)
         del test
@@ -78,7 +76,7 @@ def safe_xla_alloc():
         xm.mark_step()
         del test
         return True
-    except Exception as e:
+    except (RuntimeError, OSError) as e:
         print(f"Warning: XLA allocation test failed: {e}")
         _XLA_DEVICE_CACHE = None
         return False
@@ -94,7 +92,7 @@ def get_xla_device():
 
 
 def has_xla_device():
-    return safe_xla_alloc() or _XLA_DEVICE_CACHE is not None
+    return safe_xla_alloc()
 
 
 def clear_xla_device_cache():
@@ -112,7 +110,6 @@ def setup_distributed_cuda():
         local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ.get("WORLD_SIZE", 1))
         if not torch.distributed.is_initialized():
-            # Use nccl for NVIDIA, gloo for ROCm if nccl fails
             backend = "nccl"
             if is_rocm():
                 try:
@@ -161,7 +158,6 @@ def get_device_info(include_all_devices=False):
             try:
                 free, total = torch.cuda.mem_get_info(i)
             except Exception:
-                # ROCm might not support mem_get_info
                 free, total = 0, props.total_memory
             info["cuda_devices"].append({
                 "id": i, "name": props.name,
@@ -230,13 +226,11 @@ def auto_select_device(prefer_cuda=True):
 
     IMPORTANT: Respects LOCAL_RANK for multi-GPU/DDP to avoid all processes using cuda:0.
     """
-    # DDP: respect LOCAL_RANK to avoid all processes selecting cuda:0
     if "LOCAL_RANK" in os.environ:
         local_rank = int(os.environ["LOCAL_RANK"])
         if torch.cuda.is_available():
             return f"cuda:{local_rank}"
 
-    # Single GPU/TPU selection
     if prefer_cuda and torch.cuda.is_available() and safe_cuda_alloc(0):
         return "cuda:0"
     if safe_xla_alloc():

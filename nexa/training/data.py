@@ -10,7 +10,6 @@ class ChunkDataset(torch.utils.data.Dataset):
         self.data_path = data_path
         self.block_size = block_size
         bytes_size = os.path.getsize(data_path)
-        # Ensure at least 1 sample if data is large enough
         num_tokens = bytes_size // 2
         if num_tokens < block_size + 1:
             self.length = 0
@@ -39,7 +38,6 @@ class DataLoaderLite:
         self.block_size = block_size
         self.data_path = data_path
 
-        # TPU: use simple memmap without DataLoader to save RAM
         if is_xla_device(device):
             self.data = np.memmap(data_path, dtype=np.uint16, mode="r")
             num_tokens = len(self.data)
@@ -76,7 +74,6 @@ class CUDAPrefetcher:
         self.batch_size = dataloader_lite.batch_size
         self.block_size = dataloader_lite.block_size
 
-        # TPU: simple random sampling from memmap
         if is_xla_device(self.device):
             self.data = dataloader_lite.data
             self.length = dataloader_lite.length
@@ -94,7 +91,6 @@ class CUDAPrefetcher:
         self.preload()
 
     def preload(self):
-        # TPU: simple random batch sampling
         if is_xla_device(self.device):
             indices = np.random.randint(0, self.length, size=self.batch_size)
             chunks = []
@@ -111,7 +107,6 @@ class CUDAPrefetcher:
             self.next_y = y.to(self.device)
             return
 
-        # CUDA: use DataLoader
         try:
             chunk = next(self.iter)
         except StopIteration:

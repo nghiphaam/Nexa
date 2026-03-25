@@ -218,7 +218,6 @@ class NexaModel(nn.Module):
         probs = F.softmax(logits, dim=-1)
         prob_sum = probs.sum(dim=-1, keepdim=True)
 
-        # Handle edge case: all probs filtered out (top-k/top-p/min-p too aggressive)
         if (prob_sum == 0).any():
             valid_mask = logits > float("-inf")
             probs = torch.where(valid_mask, 1.0, 0.0)

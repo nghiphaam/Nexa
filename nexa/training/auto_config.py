@@ -10,7 +10,8 @@ def auto_config(config: Config) -> Config:
         config.compile_model = False
 
         # Only auto-adjust grad_accum if user didn't explicitly set batch_size or grad_accum
-        # Check if values differ from defaults (batch_size=2, grad_accum_steps=16)
+        # NOTE: This heuristic checks if values differ from defaults (batch_size=2, grad_accum_steps=16)
+        # Limitation: If user explicitly sets batch_size=2, it will be treated as default
         user_set_batch = config.batch_size != 2
         user_set_accum = config.grad_accum_steps != 16
 

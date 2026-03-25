@@ -1,6 +1,6 @@
 # Nexa
 
-Nexa is a compact transformer codebase for text generation, distributed training, and experimental multimodal image-text training.
+Nexa is a compact transformer codebase for text generation, distributed training, and multimodal image-text understanding.
 
 ## What is in this repo
 
@@ -23,21 +23,9 @@ Nexa is a compact transformer codebase for text generation, distributed training
 ### Multimodal image understanding (Nexa 1.5)
 - `MultimodalModel` in [nexa/model/multimodal_model.py](nexa/model/multimodal_model.py)
 - Frozen SigLIP vision encoder in [nexa/vision/vision_encoder.py](nexa/vision/vision_encoder.py)
-- Vision projector, image-text gate, image dropout, patch selection, image preprocessing in [nexa/vision/](nexa/vision/)
-- Multimodal trainer, contrastive loss, collapse detection, curriculum loader, and image usage tracking in [nexa/training/](nexa/training/)
-
-## Current status
-
-### Implemented
-- Text-only training and generation
-- Multi-GPU / TPU-aware training infrastructure
-- Multimodal image-text training path
-- Multimodal special-token utilities
-
-### Not implemented yet
-- Full multimodal autoregressive generation in `MultimodalModel.generate()`
-  - Current behavior explicitly raises `NotImplementedError` when `images` are passed for generation.
-  - Training and evaluation with `forward(..., images=...)` are implemented.
+- Vision projector, image-text gate, image dropout, patch selection in [nexa/vision/](nexa/vision/)
+- Multimodal trainer, contrastive loss, curriculum loader in [nexa/training/](nexa/training/)
+- Complete autoregressive generation with image inputs
 
 ## Install
 
@@ -53,46 +41,78 @@ For TPU/XLA or ROCm, install the matching PyTorch build for your environment.
 
 ## Quick start
 
-### Import the package
+### 1. Training from scratch
 
-```python
-from nexa import Config, NexaModel, MultimodalModel, load_tokenizer
+```bash
+# Prepare dataset
+python pre_train.py \
+  --dataset HuggingFaceFW/fineweb-edu \
+  --dataset-config sample-350BT \
+  --data-dir data \
+  --max-samples 500000
+
+# Train with auto-config
+python train.py \
+  --data-dir data \
+  --device auto \
+  --preset auto \
+  --max-iters 5000 \
+  --checkpoint-dir checkpoints
 ```
 
-### Text model
+### 2. Inference with trained model
 
-```python
-from nexa import Config, NexaModel, load_tokenizer
+```bash
+# Interactive chat
+python archive/chat.py --checkpoint checkpoints/best.pt
 
-config = Config(device="cpu")
-tokenizer = load_tokenizer()
-config.vocab_size = tokenizer.get_vocab_size()
-model = NexaModel(config)
+# Serve OpenAI-compatible API
+python archive/chat.py \
+  --checkpoint checkpoints/best.pt \
+  --port 8000
 ```
 
-### Multimodal model
+### 3. LoRA fine-tuning
 
-```python
-from nexa import Config, MultimodalModel
-from nexa.tokenizer.multimodal_tokenizer import add_multimodal_tokens
-
-config = Config(device="cpu")
-model = MultimodalModel(config)
+```bash
+python archive/chat.py \
+  --checkpoint checkpoints/best.pt \
+  --finetune \
+  --data data/sft_seed.jsonl \
+  --sft-epochs 2 \
+  --lora-rank 8
 ```
+
+### 4. Notebook workflow
+
+See [nexa_notebook.ipynb](nexa_notebook.ipynb) for complete training + self-improvement + LoRA + API serving workflow.
 
 ## Main package layout
 
-- [nexa/](nexa/)
-  - [nexa/model/](nexa/model/)
-  - [nexa/tokenizer/](nexa/tokenizer/)
-  - [nexa/training/](nexa/training/)
-  - [nexa/vision/](nexa/vision/)
-  - [nexa/utils/](nexa/utils/)
+- [nexa/](nexa/) - Core package
+  - [nexa/model/](nexa/model/) - Model architectures (NexaModel, MultimodalModel)
+  - [nexa/tokenizer/](nexa/tokenizer/) - Tokenization (BPE + multimodal tokens)
+  - [nexa/training/](nexa/training/) - Training loop, optimizer, data loading
+  - [nexa/vision/](nexa/vision/) - Vision encoder, projector, preprocessing
+  - [nexa/utils/](nexa/utils/) - Device detection, distributed training utils
+- [train.py](train.py) - Main training script
+- [pre_train.py](pre_train.py) - Dataset preparation
+- [archive/chat.py](archive/chat.py) - Inference, API serving, LoRA fine-tuning
+- [nexa_notebook.ipynb](nexa_notebook.ipynb) - Complete workflow notebook
 
-## Notes
+## Model Architecture
 
-- The README reflects the current package layout, not the older `lm.py` / `chat.py` structure.
-- If you need production multimodal inference, that part still needs implementation on top of the current training stack.
+**Nexa** (1.26B parameters):
+- 24 layers, 2048 hidden dim, 16 Q heads, 4 KV heads (GQA 4:1)
+- SwiGLU FFN, RMSNorm, RoPE positional encoding
+- Sliding window attention with KV cache
+- BPE tokenizer (50,261 vocab, GPT-2 compatible)
+
+**Training features**:
+- Mixed precision (bfloat16/float16)
+- Gradient accumulation + checkpointing
+- Auto-config for TPU/CUDA/ROCm
+- Distributed training (DDP, XLA)
 
 ## License
 
