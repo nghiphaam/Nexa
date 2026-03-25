@@ -41,7 +41,7 @@ For TPU/XLA or ROCm, install the matching PyTorch build for your environment.
 
 ## Quick start
 
-### 1. Training from scratch
+### Training from scratch
 
 ```bash
 # Prepare dataset
@@ -60,33 +60,6 @@ python train.py \
   --checkpoint-dir checkpoints
 ```
 
-### 2. Inference with trained model
-
-```bash
-# Interactive chat
-python archive/chat.py --checkpoint checkpoints/best.pt
-
-# Serve OpenAI-compatible API
-python archive/chat.py \
-  --checkpoint checkpoints/best.pt \
-  --port 8000
-```
-
-### 3. LoRA fine-tuning
-
-```bash
-python archive/chat.py \
-  --checkpoint checkpoints/best.pt \
-  --finetune \
-  --data data/sft_seed.jsonl \
-  --sft-epochs 2 \
-  --lora-rank 8
-```
-
-### 4. Notebook workflow
-
-See [nexa_notebook.ipynb](nexa_notebook.ipynb) for complete training + self-improvement + LoRA + API serving workflow.
-
 ## Main package layout
 
 - [nexa/](nexa/) - Core package
@@ -97,8 +70,6 @@ See [nexa_notebook.ipynb](nexa_notebook.ipynb) for complete training + self-impr
   - [nexa/utils/](nexa/utils/) - Device detection, distributed training utils
 - [train.py](train.py) - Main training script
 - [pre_train.py](pre_train.py) - Dataset preparation
-- [archive/chat.py](archive/chat.py) - Inference, API serving, LoRA fine-tuning
-- [nexa_notebook.ipynb](nexa_notebook.ipynb) - Complete workflow notebook
 
 ## Model Architecture
 

@@ -107,7 +107,7 @@ def train(config: Config):
 
     if world_size > 1:
         if is_xla_device(device):
-            pass
+            pass  # XLA handles distribution automatically
         elif is_distributed():
             model = torch.nn.parallel.DistributedDataParallel(
                 model,

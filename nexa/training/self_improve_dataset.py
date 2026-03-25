@@ -26,11 +26,8 @@ def save_batch(filepath: str, samples: list[dict]):
         filepath: Path to JSONL file
         samples: List of training samples
     """
-    os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
-
-    with open(filepath, "a", encoding="utf-8") as f:
-        for sample in samples:
-            f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+    for sample in samples:
+        append_jsonl(filepath, sample)
 
 
 def load_jsonl(filepath: str) -> list[dict]:

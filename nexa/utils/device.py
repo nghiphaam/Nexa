@@ -55,7 +55,7 @@ def safe_cuda_alloc(device_id=0):
             if free < 100 * 1024 * 1024:
                 return False
         except Exception:
-            pass
+            pass  # Ignore memory check if unavailable
         test = torch.empty((1, 1024, 1024), device=f"cuda:{device_id}", dtype=torch.float32)
         del test
         torch.cuda.empty_cache()
@@ -216,7 +216,7 @@ def configure_tf32_runtime():
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
         except Exception:
-            pass
+            pass  # Ignore memory check if unavailable
     torch.backends.cuda._tf32_configured = True
 
 
