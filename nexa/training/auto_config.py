@@ -8,9 +8,18 @@ def auto_config(config: Config) -> Config:
     if is_xla_device(config.device):
         config.dtype = "bfloat16"
         config.compile_model = False
-        target_tokens = (50000 if config.preset == "auto"
-                        else {"low": 16000, "mid": 50000, "high": 120000}.get(config.preset, 50000))
-        config.grad_accum_steps = max(1, target_tokens // max(1, config.batch_size * config.block_size))
+
+        # Only auto-adjust grad_accum if user didn't explicitly set batch_size or grad_accum
+        # Check if values differ from defaults (batch_size=2, grad_accum_steps=16)
+        user_set_batch = config.batch_size != 2
+        user_set_accum = config.grad_accum_steps != 16
+
+        if not user_set_batch and not user_set_accum:
+            # Auto-configure both
+            target_tokens = (50000 if config.preset == "auto"
+                            else {"low": 16000, "mid": 50000, "high": 120000}.get(config.preset, 50000))
+            config.grad_accum_steps = max(1, target_tokens // max(1, config.batch_size * config.block_size))
+
         if config.sliding_window is None:
             config.sliding_window = max(config.block_size, 512)
         print(f"[auto_config] TPU/XLA device={config.device}")
