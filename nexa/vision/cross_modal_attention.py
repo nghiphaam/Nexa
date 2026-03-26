@@ -7,18 +7,8 @@ import torch.nn as nn
 class _FusionBlock(nn.Module):
     def __init__(self, n_embd: int, n_head: int, hidden_size: int, dropout: float):
         super().__init__()
-        self.text_to_image = nn.MultiheadAttention(
-            embed_dim=n_embd,
-            num_heads=n_head,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.image_to_text = nn.MultiheadAttention(
-            embed_dim=n_embd,
-            num_heads=n_head,
-            dropout=dropout,
-            batch_first=True,
-        )
+        self.text_to_image = nn.MultiheadAttention(embed_dim=n_embd, num_heads=n_head, dropout=dropout, batch_first=True)
+        self.image_to_text = nn.MultiheadAttention(embed_dim=n_embd, num_heads=n_head, dropout=dropout, batch_first=True)
         self.text_norm1 = nn.LayerNorm(n_embd)
         self.image_norm1 = nn.LayerNorm(n_embd)
         self.text_norm2 = nn.LayerNorm(n_embd)
@@ -32,7 +22,7 @@ class _FusionBlock(nn.Module):
         self.image_ff = nn.Sequential(
             nn.Linear(n_embd, hidden_size),
             nn.GELU(),
-                        nn.Dropout(dropout),
+            nn.Dropout(dropout),
             nn.Linear(hidden_size, n_embd),
         )
 
@@ -53,9 +43,10 @@ class CrossModalAttentionFusion(nn.Module):
 
     def __init__(self, n_embd: int, n_head: int = 8, hidden_size: int = 2304, n_layer: int = 2, dropout: float = 0.1):
         super().__init__()
+        n_layer = max(0, int(n_layer))
         self.layers = nn.ModuleList([
             _FusionBlock(n_embd=n_embd, n_head=n_head, hidden_size=hidden_size, dropout=dropout)
-            for _ in range(max(1, n_layer))
+            for _ in range(n_layer)
         ])
 
     def forward(self, text_tokens, image_tokens):

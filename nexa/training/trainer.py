@@ -20,7 +20,7 @@ from nexa.utils.device import (
     barrier,
     is_distributed,
 )
-from nexa.training.data import DataLoaderLite, CUDAPrefetcher
+from nexa.training.data import DataLoaderLite, CUDAPrefetcher, resolve_token_dtype
 from nexa.training.optimizer import configure_optimizer, get_lr
 from nexa.training.utils import (
     make_amp_context,
@@ -89,13 +89,14 @@ def train(config: Config):
             f"Missing {train_path} or {val_path}. Run pre_train.py first."
         )
 
-    train_data = np.memmap(train_path, dtype=np.uint16, mode="r")
-    val_data = np.memmap(val_path, dtype=np.uint16, mode="r")
+    token_dtype = resolve_token_dtype(vocab_size=config.vocab_size)
+    train_data = np.memmap(train_path, dtype=token_dtype, mode="r")
+    val_data = np.memmap(val_path, dtype=token_dtype, mode="r")
 
     if is_main_process:
         print(f"\nTrain tokens : {len(train_data):,}")
         print(f"Val tokens   : {len(val_data):,}")
-        print(f"Tokenizer    : Nexa BPE (vocab={config.vocab_size})")
+        print(f"Tokenizer    : Nexa BPE (vocab={config.vocab_size}, dtype={np.dtype(token_dtype).name})")
         print(
             f"\nArchitecture : block={config.block_size}, embd={config.n_embd}, "
             f"q_head={config.n_head}, kv_head={config.n_kv_head}, layer={config.n_layer}"
@@ -183,7 +184,13 @@ def train(config: Config):
 
     eos_id = tokenizer.token_to_id(EOS_TOKEN)
     base_loader = DataLoaderLite(
-        train_path, config.batch_size, config.block_size, device, eos_id=eos_id
+        train_path,
+        config.batch_size,
+        config.block_size,
+        device,
+        eos_id=eos_id,
+        token_dtype=token_dtype,
+        vocab_size=config.vocab_size,
     )
     train_loader = CUDAPrefetcher(base_loader)
 

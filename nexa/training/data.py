@@ -1,16 +1,29 @@
 """Data loading utilities."""
 import os
+
 import numpy as np
 import torch
+
 from nexa.utils.device import is_cuda_device, is_xla_device
 
 
+def resolve_token_dtype(vocab_size=None, token_dtype=None):
+    if token_dtype is not None:
+        if token_dtype in (np.uint16, 'uint16', 'np.uint16'):
+            return np.uint16
+        if token_dtype in (np.uint32, 'uint32', 'np.uint32'):
+            return np.uint32
+        raise ValueError(f'Unsupported token dtype: {token_dtype}')
+    return np.uint32 if vocab_size is not None and int(vocab_size) >= 65536 else np.uint16
+
+
 class ChunkDataset(torch.utils.data.Dataset):
-    def __init__(self, data_path, block_size):
+    def __init__(self, data_path, block_size, token_dtype=None, vocab_size=None):
         self.data_path = data_path
         self.block_size = block_size
+        self.token_dtype = resolve_token_dtype(vocab_size=vocab_size, token_dtype=token_dtype)
         bytes_size = os.path.getsize(data_path)
-        num_tokens = bytes_size // 2
+        num_tokens = bytes_size // np.dtype(self.token_dtype).itemsize
         if num_tokens < block_size + 1:
             self.length = 0
         else:
@@ -24,22 +37,23 @@ class ChunkDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         if self.data is None:
-            self.data = np.memmap(self.data_path, dtype=np.uint16, mode="r")
+            self.data = np.memmap(self.data_path, dtype=self.token_dtype, mode='r')
         start = idx * self.block_size
         chunk = self.data[start: start + self.block_size + 1]
-        return torch.from_numpy(chunk.astype(np.int32))
+        return torch.from_numpy(chunk.astype(np.int64))
 
 
 class DataLoaderLite:
-    def __init__(self, data_path, batch_size, block_size, device, eos_id=None):
+    def __init__(self, data_path, batch_size, block_size, device, eos_id=None, token_dtype=None, vocab_size=None):
         self.device = device
         self.eos_id = eos_id
         self.batch_size = batch_size
         self.block_size = block_size
         self.data_path = data_path
+        self.token_dtype = resolve_token_dtype(vocab_size=vocab_size, token_dtype=token_dtype)
 
         if is_xla_device(device):
-            self.data = np.memmap(data_path, dtype=np.uint16, mode="r")
+            self.data = np.memmap(data_path, dtype=self.token_dtype, mode='r')
             num_tokens = len(self.data)
             if num_tokens < block_size + 1:
                 self.length = 0
@@ -54,11 +68,15 @@ class DataLoaderLite:
             self.loader = None
             self.iter = None
         else:
-            self.dataset = ChunkDataset(data_path, block_size)
+            self.dataset = ChunkDataset(data_path, block_size, token_dtype=self.token_dtype)
             n_w = min(4, os.cpu_count() or 1) if is_cuda_device(device) else 0
             self.loader = torch.utils.data.DataLoader(
-                self.dataset, batch_size=batch_size, shuffle=True, drop_last=True,
-                num_workers=n_w, pin_memory=is_cuda_device(device),
+                self.dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                drop_last=True,
+                num_workers=n_w,
+                pin_memory=is_cuda_device(device),
                 persistent_workers=(n_w > 0 and is_cuda_device(device)),
                 prefetch_factor=2 if n_w > 0 else None,
             )
@@ -97,7 +115,7 @@ class CUDAPrefetcher:
             for idx in indices:
                 start = idx * self.block_size
                 chunk = self.data[start: start + self.block_size + 1]
-                chunks.append(torch.from_numpy(chunk.astype(np.int32)))
+                chunks.append(torch.from_numpy(chunk.astype(np.int64)))
             chunk = torch.stack(chunks)
             x = chunk[:, :-1].contiguous()
             y = chunk[:, 1:].contiguous().clone()
