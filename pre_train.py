@@ -63,8 +63,18 @@ class NexaTokenizer:
             return self.special_map[token]
         raise ValueError(f"Unknown token: {token}")
 
+    def _normalize_text(self, text):
+        if text is None:
+            return ""
+        if not isinstance(text, str):
+            text = str(text)
+        return text.replace("\r\n", "\n")
+
     def encode(self, text):
-        parts = self.special_pattern.split(text)
+        normalized = self._normalize_text(text)
+        if not normalized:
+            return type("E", (), {"ids": []})()
+        parts = self.special_pattern.split(normalized)
         ids = []
         for p in parts:
             if p in self.special_map:
@@ -74,14 +84,7 @@ class NexaTokenizer:
         return type("E", (), {"ids": ids})()
 
     def encode_batch(self, texts):
-        # NEXA 1.2: Return empty encoding object instead of None for safety
-        results = []
-        for t in texts:
-            if t and t.strip():
-                results.append(self.encode(t))
-            else:
-                results.append(type("E", (), {"ids": []})())  # Empty encoding object
-        return results
+        return [self.encode(t) for t in texts]
 
 
 def _hf_login():
@@ -376,6 +379,32 @@ def _write_manifest(data_dir, payload):
     return manifest_path
 
 
+def _load_manifest(data_dir):
+    manifest_path = os.path.join(data_dir, DATASET_MANIFEST)
+    if not os.path.exists(manifest_path):
+        return None
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _snapshot_matches_request(data_dir, dataset_repo, dataset_name, split_str, max_samples):
+    snapshot_dir = os.path.join(data_dir, DATASET_SNAPSHOT_DIRNAME)
+    manifest = _load_manifest(data_dir)
+    if manifest is None:
+        return False
+    return (
+        manifest.get("snapshot_dir") == snapshot_dir
+        and manifest.get("repo_id") == dataset_repo
+        and manifest.get("subset_name") == dataset_name
+        and manifest.get("split") == split_str
+        and int(manifest.get("max_samples", 0)) == int(max_samples)
+        and os.path.exists(snapshot_dir)
+    )
+
+
 def download_dataset(
     data_dir,
     dataset_repo: str,
@@ -489,7 +518,13 @@ def prepare_data(
 
     split_str = "train" if max_samples <= 0 else f"train[:{max_samples}]"
     snapshot_dir = os.path.join(data_dir, DATASET_SNAPSHOT_DIRNAME)
-    if os.path.exists(snapshot_dir) and not plan["use_streaming"]:
+    if not plan["use_streaming"] and _snapshot_matches_request(
+        data_dir,
+        dataset_repo,
+        dataset_name,
+        split_str,
+        max_samples,
+    ):
         from datasets import load_from_disk
 
         ds_train = load_from_disk(snapshot_dir)

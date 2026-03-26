@@ -17,6 +17,12 @@ def resolve_token_dtype(vocab_size=None, token_dtype=None):
     return np.uint32 if vocab_size is not None and int(vocab_size) >= 65536 else np.uint16
 
 
+def _num_chunks(num_tokens, block_size):
+    if num_tokens < block_size + 1:
+        return 0
+    return ((num_tokens - block_size - 1) // block_size) + 1
+
+
 class ChunkDataset(torch.utils.data.Dataset):
     def __init__(self, data_path, block_size, token_dtype=None, vocab_size=None):
         self.data_path = data_path
@@ -24,12 +30,7 @@ class ChunkDataset(torch.utils.data.Dataset):
         self.token_dtype = resolve_token_dtype(vocab_size=vocab_size, token_dtype=token_dtype)
         bytes_size = os.path.getsize(data_path)
         num_tokens = bytes_size // np.dtype(self.token_dtype).itemsize
-        if num_tokens < block_size + 1:
-            self.length = 0
-        else:
-            self.length = (num_tokens - block_size - 1) // block_size
-            if self.length == 0 and num_tokens >= block_size + 1:
-                self.length = 1
+        self.length = _num_chunks(num_tokens, block_size)
         self.data = None
 
     def __len__(self):
@@ -55,12 +56,7 @@ class DataLoaderLite:
         if is_xla_device(device):
             self.data = np.memmap(data_path, dtype=self.token_dtype, mode='r')
             num_tokens = len(self.data)
-            if num_tokens < block_size + 1:
-                self.length = 0
-            else:
-                self.length = (num_tokens - block_size - 1) // block_size
-                if self.length == 0 and num_tokens >= block_size + 1:
-                    self.length = 1
+            self.length = _num_chunks(num_tokens, block_size)
             if self.length == 0:
                 raise ValueError(
                     f"Dataset {data_path} is too small for block_size={block_size}: got {num_tokens} tokens"

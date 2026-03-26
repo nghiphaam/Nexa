@@ -10,6 +10,7 @@ class VectorMemory:
         self.db = []
         self._emb_cache_tensor = None
         self._emb_cache_dirty = True
+        self._emb_cache_device = None
 
     def add(self, embedding, kv_data):
         if embedding.dim() == 1:
@@ -22,20 +23,22 @@ class VectorMemory:
     def _rebuild_emb_cache(self, device):
         if not self.db:
             self._emb_cache_tensor = None
+            self._emb_cache_device = None
             return
         embs = [entry[0].to(device) for entry in self.db]
         self._emb_cache_tensor = torch.cat(embs, dim=0)
         self._emb_cache_dirty = False
+        self._emb_cache_device = torch.device(device)
 
     def retrieve_kv(self, query_ids, decay=0.05, top_k=None, min_score=0.2):
         if not self.db:
             return []
         device = query_ids.device if isinstance(query_ids, torch.Tensor) else "cpu"
-        if self._emb_cache_dirty:
+        if self._emb_cache_dirty or self._emb_cache_device != torch.device(device):
             self._rebuild_emb_cache(device)
         if self._emb_cache_tensor is None:
             return []
-        q = query_ids.float()
+        q = query_ids.float() if isinstance(query_ids, torch.Tensor) else torch.as_tensor(query_ids, dtype=torch.float32, device=device)
         if q.dim() == 1:
             q = q.unsqueeze(0)
         q_norm = q / (q.norm(dim=-1, keepdim=True) + 1e-8)
@@ -44,10 +47,15 @@ class VectorMemory:
         if top_k is not None:
             top_k = min(top_k, len(self.db))
             _, indices = torch.topk(sims, top_k)
-            return [(self.db[i][1], sims[i].item()) for i in indices if sims[i].item() >= min_score]
+            return [
+                (self.db[int(i)][1], sims[int(i)].item())
+                for i in indices.tolist()
+                if sims[int(i)].item() >= min_score
+            ]
         return [(self.db[i][1], sims[i].item()) for i in range(len(self.db)) if sims[i].item() >= min_score]
 
     def clear(self):
         self.db.clear()
         self._emb_cache_tensor = None
         self._emb_cache_dirty = True
+        self._emb_cache_device = None

@@ -1,22 +1,20 @@
 """Prepare reasoning datasets for training."""
 import json
 import os
-import sys
-from pathlib import Path
+import importlib
 
 
-def ensure_pkg(name, pip_name=None):
+def require_pkg(name, pip_name=None):
     try:
-        __import__(name)
-    except ImportError:
-        print(f"Installing {pip_name or name}...")
-        import subprocess
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "-q", pip_name or name]
-        )
+        importlib.import_module(name)
+    except ImportError as exc:
+        package = pip_name or name
+        raise RuntimeError(
+            f"Missing required dependency '{package}'. Install it before running prepare_reasoning.py."
+        ) from exc
 
 
-ensure_pkg("datasets")
+require_pkg("datasets")
 
 
 def download_and_convert(repo_id: str, output_path: str, format_fn):

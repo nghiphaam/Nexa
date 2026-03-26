@@ -29,7 +29,17 @@ def auto_config(config: Config) -> Config:
               f"sliding_window={config.sliding_window}, grad_ckpt={config.use_grad_ckpt}")
         return config
 
+    if not is_cuda_device(config.device):
+        config.dtype = "float32"
+        config.compile_model = False
+        if str(config.device) == "cpu":
+            config.batch_size = min(config.batch_size, 1)
+            target_tokens = 50000
+            config.grad_accum_steps = max(1, target_tokens // max(1, config.batch_size * config.block_size))
+        return config
+
     if not torch.cuda.is_available():
+        config.device = "cpu"
         config.dtype = "float32"
         config.compile_model = False
         config.batch_size = min(config.batch_size, 1)

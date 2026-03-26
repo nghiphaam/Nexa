@@ -39,6 +39,27 @@ def collect_lora_params(model):
     return [param for name, param in model.named_parameters() if param.requires_grad and 'lora_' in name]
 
 
+def build_autoregressive_batch(token_rows, pad_id, device):
+    if not token_rows:
+        raise ValueError("token_rows must not be empty")
+
+    max_len = max(len(ids) for ids in token_rows)
+    if max_len <= 0:
+        raise ValueError("Each token row must contain at least one token")
+
+    padded_ids = []
+    padded_labels = []
+    for ids in token_rows:
+        pad_len = max_len - len(ids)
+        padded_ids.append(ids + [pad_id] * pad_len)
+        shifted_labels = ids[1:] + [-100]
+        padded_labels.append(shifted_labels + [-100] * pad_len)
+
+    input_ids = torch.tensor(padded_ids, dtype=torch.long, device=device)
+    labels = torch.tensor(padded_labels, dtype=torch.long, device=device)
+    return input_ids, labels
+
+
 def load_sft_data(data_path):
     data = []
     with open(data_path, 'r', encoding='utf-8') as f:
@@ -126,16 +147,7 @@ def main():
                     ids = ids[:config.block_size]
                 token_rows.append(ids)
 
-            max_len = max(len(ids) for ids in token_rows)
-            padded_ids = []
-            padded_labels = []
-            for ids in token_rows:
-                pad_len = max_len - len(ids)
-                padded_ids.append(ids + [config.eos_id] * pad_len)
-                padded_labels.append(ids + [-100] * pad_len)
-
-            input_ids = torch.tensor(padded_ids, dtype=torch.long, device=device)
-            labels = torch.tensor(padded_labels, dtype=torch.long, device=device)
+            input_ids, labels = build_autoregressive_batch(token_rows, config.eos_id, device)
 
             _, loss = model(input_ids, labels)
             optimizer.zero_grad(set_to_none=True)
