@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import contextlib
+from typing import Any
+
 import torch
 from torch.utils.tensorboard import SummaryWriter
+
 from nexa.training.contrastive_loss import ContrastiveLoss
 from nexa.training.collapse_detector import CollapseEarlyStopping
 from nexa.training.image_usage_tracker import ImageUsageTracker
@@ -33,6 +36,12 @@ class MultimodalTrainer:
         total_steps = getattr(config, "max_iters", 10000)
         self.optimizers = self._configure_optimizer_with_scheduler(total_steps)
         self.scaler = self._create_grad_scaler()
+
+    def _model_device(self):
+        try:
+            return next(self.model.parameters()).device
+        except StopIteration:
+            return torch.device(getattr(self.config, "device", "cpu"))
 
     def _create_grad_scaler(self):
         if not torch.cuda.is_available():
@@ -64,7 +73,7 @@ class MultimodalTrainer:
         from nexa.vision.projector import VisionProjector
         from nexa.vision.image_text_gate import ImageTextGate
         from nexa.vision.cross_modal_attention import CrossModalAttentionFusion
-        from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+        from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
         projector_params = []
         fusion_params = []
@@ -99,6 +108,8 @@ class MultimodalTrainer:
             fallback_params = []
 
         projector_group = projector_params + fusion_params
+        if not projector_group:
+            raise ValueError("No trainable projector/fusion parameters found for multimodal training")
         optimizer_projector = torch.optim.AdamW(projector_group, lr=5e-4, betas=(0.9, 0.95))
 
         extra_trainable = lora_params + fallback_params
@@ -161,7 +172,120 @@ class MultimodalTrainer:
 
         return total_loss, loss_dict
 
+    def _get_eos_id(self) -> int:
+        eos_id = getattr(self.config, "eos_id", None)
+        if eos_id is not None:
+            return int(eos_id)
+        token_to_id = getattr(self.tokenizer, "token_to_id", None)
+        if callable(token_to_id):
+            for token in ("<|endoftext|>", "</s>"):
+                value = token_to_id(token)
+                if value is not None:
+                    return int(value)
+        return 0
+
+    def _extract_image(self, sample: dict[str, Any]):
+        if "images" in sample:
+            return sample["images"]
+        if "image" in sample:
+            return sample["image"]
+        return None
+
+    def _build_text_from_sample(self, sample: dict[str, Any]) -> str:
+        if "text" in sample and sample["text"]:
+            return str(sample["text"])
+
+        if "messages" in sample and sample["messages"]:
+            parts = []
+            for msg in sample["messages"]:
+                role = msg.get("role", "user")
+                content = str(msg.get("content", ""))
+                if role == "user":
+                    parts.append(f"<|user|>{content}<|assistant|>")
+                elif role == "assistant":
+                    parts.append(f"{content}<|endoftext|>")
+                else:
+                    parts.append(content)
+            text = "".join(parts).strip()
+            if text:
+                return text
+
+        prompt = str(sample.get("prompt") or sample.get("question") or sample.get("instruction") or "")
+        response = str(sample.get("response") or sample.get("answer") or sample.get("caption") or "")
+        if prompt and response:
+            return f"<|user|>{prompt}<|assistant|>{response}<|endoftext|>"
+        if prompt:
+            return f"<|user|>{prompt}<|assistant|>"
+        if response:
+            return f"<|assistant|>{response}<|endoftext|>"
+        raise ValueError("Could not build multimodal training text from sample")
+
+    def _collate_images(self, images):
+        present = [img for img in images if img is not None]
+        if not present:
+            return None
+        if len(present) != len(images):
+            raise ValueError("Mixed multimodal batch with missing images is not supported")
+        if all(torch.is_tensor(img) for img in present):
+            tensors = [img if img.dim() == 4 else img.unsqueeze(0) for img in present]
+            return torch.cat(tensors, dim=0).to(self._model_device())
+        return present if len(present) > 1 else present[0]
+
+    def _prepare_batch(self, batch):
+        device = self._model_device()
+
+        if isinstance(batch, dict) and "input_ids" in batch and "labels" in batch:
+            prepared = dict(batch)
+            prepared["input_ids"] = batch["input_ids"].to(device)
+            prepared["labels"] = batch["labels"].to(device)
+            if prepared.get("images") is None and prepared.get("image") is not None:
+                prepared["images"] = prepared.pop("image")
+            if torch.is_tensor(prepared.get("images")):
+                prepared["images"] = prepared["images"].to(device)
+            return prepared
+
+        samples = batch if isinstance(batch, list) else [batch]
+        texts = [self._build_text_from_sample(sample) for sample in samples]
+        token_rows = [self.tokenizer.encode(text).ids[: getattr(self.config, "block_size", 512)] for text in texts]
+        if not token_rows:
+            raise ValueError("Empty multimodal batch")
+
+        eos_id = self._get_eos_id()
+        max_len = max(len(ids) for ids in token_rows)
+        padded_ids = []
+        padded_labels = []
+        for ids in token_rows:
+            pad_len = max_len - len(ids)
+            padded_ids.append(ids + [eos_id] * pad_len)
+            padded_labels.append(ids + [-100] * pad_len)
+
+        input_ids = torch.tensor(padded_ids, dtype=torch.long, device=device)
+        labels = torch.tensor(padded_labels, dtype=torch.long, device=device)
+        prompts = [
+            str(sample.get("prompt") or sample.get("question") or sample.get("instruction") or "")
+            for sample in samples
+        ]
+        images = self._collate_images([self._extract_image(sample) for sample in samples])
+
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "images": images,
+            "prompt": prompts,
+            "raw_samples": samples,
+        }
+
+    def _first_image_for_eval(self, images):
+        if images is None:
+            return None
+        if torch.is_tensor(images):
+            return images[0:1]
+        if isinstance(images, (list, tuple)):
+            return images[0]
+        return images
+
     def train_step(self, batch):
+        batch = self._prepare_batch(batch)
         if "input_ids" not in batch or "labels" not in batch:
             raise ValueError("Batch must include 'input_ids' and 'labels'")
 
@@ -221,6 +345,7 @@ class MultimodalTrainer:
 
         self.global_step += 1
         loss_dict["grad_norm"] = grad_norm.item()
+        loss_dict["prepared_batch"] = batch
         return loss_dict
 
     def train_epoch(self, epoch):
@@ -228,19 +353,22 @@ class MultimodalTrainer:
         data = self.curriculum_loader.get_epoch_data(epoch)
         log_every = max(1, getattr(self.config, "log_interval", 50))
 
-        for step, batch in enumerate(data):
+        for step, raw_batch in enumerate(data):
+            batch = self._prepare_batch(raw_batch)
             loss_dict = self.train_step(batch)
             if step % log_every == 0:
-                print(f"[epoch {epoch + 1}] step {step}: {loss_dict}")
-                            if step % self.collapse_check_interval == 0 and batch.get("images") is not None:
-                similarity = self.collapse_detector.test_image_usage(
-                    batch["images"][0],
-                    batch.get("prompt", [""])[0],
-                )
+                printable = {k: v for k, v in loss_dict.items() if k != "prepared_batch"}
+                print(f"[epoch {epoch + 1}] step {step}: {printable}")
+
+            images = batch.get("images")
+            if step % self.collapse_check_interval == 0 and images is not None:
+                image_for_eval = self._first_image_for_eval(images)
+                prompt_for_eval = batch.get("prompt", [""])[0] if batch.get("prompt") else ""
+                similarity = self.collapse_detector.test_image_usage(image_for_eval, prompt_for_eval)
                 self.writer.add_scalar("eval/collapse_similarity", similarity, self.global_step)
                 usage_score = self.image_usage_tracker.compute_image_usage_score(
                     self.model,
-                    batch["images"][0:1],
+                    image_for_eval,
                     batch["input_ids"][0:1],
                 )
                 self.writer.add_scalar("eval/image_usage_score", usage_score, self.global_step)
