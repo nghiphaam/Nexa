@@ -587,6 +587,7 @@ class NexaModel(nn.Module):
         max_new_tokens = int(max_new_tokens or getattr(self.config, "gen_len", 200))
         orig_prompt_len = idx.size(1)
         eos_id = getattr(self.config, "eos_id", None) if eos_id is None else eos_id
+        all_so_far = idx
 
         try:
             self.eval()
@@ -709,7 +710,8 @@ class NexaModel(nn.Module):
                 logits = self._project_logits(x[:, -1, :], head=head)
         except Exception as exc:
             import logging
-            logging.error(f"Generation stream failed after {max(0, all_so_far.size(1) - orig_prompt_len)} tokens: {exc}")
+            generated_tokens = max(0, all_so_far.size(1) - orig_prompt_len)
+            logging.error(f"Generation stream failed after {generated_tokens} tokens: {exc}")
             raise
         finally:
             self.train(was_training)

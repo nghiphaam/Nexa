@@ -44,13 +44,13 @@ class MultimodalTrainer:
             return torch.device(getattr(self.config, "device", "cpu"))
 
     def _create_grad_scaler(self):
-        if not torch.cuda.is_available():
+        if self._model_device().type != "cuda":
             return None
         use_fp16 = getattr(self.config, "use_fp16", False) or getattr(self.config, "dtype", "") == "float16"
         return torch.cuda.amp.GradScaler(enabled=use_fp16)
 
     def _autocast_context(self):
-        if not torch.cuda.is_available():
+        if self._model_device().type != "cuda":
             return contextlib.nullcontext()
         dtype_name = getattr(self.config, "dtype", "float32")
         if dtype_name == "float16":
@@ -179,7 +179,10 @@ class MultimodalTrainer:
         token_to_id = getattr(self.tokenizer, "token_to_id", None)
         if callable(token_to_id):
             for token in ("<|endoftext|>", "</s>"):
-                value = token_to_id(token)
+                try:
+                    value = token_to_id(token)
+                except (KeyError, TypeError, ValueError):
+                    continue
                 if value is not None:
                     return int(value)
         return 0
@@ -231,6 +234,26 @@ class MultimodalTrainer:
             return torch.cat(tensors, dim=0).to(self._model_device())
         return present if len(present) > 1 else present[0]
 
+    def _build_autoregressive_batch(self, token_rows, pad_id: int, device):
+        if not token_rows:
+            raise ValueError("Empty token batch")
+
+        max_len = max(len(ids) for ids in token_rows)
+        if max_len <= 0:
+            raise ValueError("Token rows must not be empty")
+
+        padded_ids = []
+        padded_labels = []
+        for ids in token_rows:
+            pad_len = max_len - len(ids)
+            padded_ids.append(ids + [pad_id] * pad_len)
+            shifted_labels = ids[1:] + [-100]
+            padded_labels.append(shifted_labels + [-100] * pad_len)
+
+        input_ids = torch.tensor(padded_ids, dtype=torch.long, device=device)
+        labels = torch.tensor(padded_labels, dtype=torch.long, device=device)
+        return input_ids, labels
+
     def _prepare_batch(self, batch):
         device = self._model_device()
 
@@ -251,16 +274,7 @@ class MultimodalTrainer:
             raise ValueError("Empty multimodal batch")
 
         eos_id = self._get_eos_id()
-        max_len = max(len(ids) for ids in token_rows)
-        padded_ids = []
-        padded_labels = []
-        for ids in token_rows:
-            pad_len = max_len - len(ids)
-            padded_ids.append(ids + [eos_id] * pad_len)
-            padded_labels.append(ids + [-100] * pad_len)
-
-        input_ids = torch.tensor(padded_ids, dtype=torch.long, device=device)
-        labels = torch.tensor(padded_labels, dtype=torch.long, device=device)
+        input_ids, labels = self._build_autoregressive_batch(token_rows, eos_id, device)
         prompts = [
             str(sample.get("prompt") or sample.get("question") or sample.get("instruction") or "")
             for sample in samples
@@ -352,10 +366,12 @@ class MultimodalTrainer:
         self.current_epoch = epoch
         data = self.curriculum_loader.get_epoch_data(epoch)
         log_every = max(1, getattr(self.config, "log_interval", 50))
+        batch_size = max(1, int(getattr(self.config, "batch_size", 1)))
 
-        for step, raw_batch in enumerate(data):
-            batch = self._prepare_batch(raw_batch)
-            loss_dict = self.train_step(batch)
+        for step, batch_start in enumerate(range(0, len(data), batch_size)):
+            raw_batch = data[batch_start: batch_start + batch_size]
+            loss_dict = self.train_step(raw_batch)
+            batch = loss_dict["prepared_batch"]
             if step % log_every == 0:
                 printable = {k: v for k, v in loss_dict.items() if k != "prepared_batch"}
                 print(f"[epoch {epoch + 1}] step {step}: {printable}")
