@@ -1,6 +1,7 @@
 """Training utilities: data loading, optimizer, lr schedule, etc."""
 import os
 import math
+import sys
 import contextlib
 import numpy as np
 import torch
@@ -47,31 +48,71 @@ def safe_load_model_state(model, state_dict, label="checkpoint"):
         return False
 
 
-def apply_preset_args(args):
+def _collect_explicit_cli_fields(argv):
+    option_to_field = {
+        "--block-size": "block_size",
+        "--batch-size": "batch_size",
+        "--n-layer": "n_layer",
+        "--n-embd": "n_embd",
+        "--n-head": "n_head",
+        "--n-kv-head": "n_kv_head",
+        "--use-grad-ckpt": "use_grad_ckpt",
+        "--no-use-grad-ckpt": "use_grad_ckpt",
+        "--compile": "compile",
+        "--no-compile": "compile",
+    }
+    explicit_fields = set()
+    for token in argv:
+        if not token.startswith("--"):
+            continue
+        field = option_to_field.get(token.split("=", 1)[0])
+        if field is not None:
+            explicit_fields.add(field)
+    return explicit_fields
+
+
+def apply_preset_args(args, argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    explicit_fields = _collect_explicit_cli_fields(argv)
+    preset_values = None
+
     if args.preset == "low":
-        args.block_size = 128
-        args.batch_size = 8
-        args.n_layer = 4
-        args.n_embd = 256
-        args.n_head = 4
-        args.n_kv_head = 1
-        args.use_grad_ckpt = False
-        args.compile = False
+        preset_values = {
+            "block_size": 128,
+            "batch_size": 8,
+            "n_layer": 4,
+            "n_embd": 256,
+            "n_head": 4,
+            "n_kv_head": 1,
+            "use_grad_ckpt": False,
+            "compile": False,
+        }
     elif args.preset == "mid":
-        args.block_size = 384
-        args.batch_size = 32
-        args.n_layer = 12
-        args.n_embd = 768
-        args.n_head = 12
-        args.n_kv_head = 4
+        preset_values = {
+            "block_size": 384,
+            "batch_size": 32,
+            "n_layer": 12,
+            "n_embd": 768,
+            "n_head": 12,
+            "n_kv_head": 4,
+        }
     elif args.preset == "high":
-        args.block_size = 512
-        args.batch_size = 128
-        args.n_layer = 16
-        args.n_embd = 1024
-        args.n_head = 16
-        args.n_kv_head = 4
-        args.use_grad_ckpt = True
+        preset_values = {
+            "block_size": 512,
+            "batch_size": 128,
+            "n_layer": 16,
+            "n_embd": 1024,
+            "n_head": 16,
+            "n_kv_head": 4,
+            "use_grad_ckpt": True,
+        }
+
+    if preset_values is None:
+        return args
+
+    for field, value in preset_values.items():
+        if field not in explicit_fields:
+            setattr(args, field, value)
     return args
 
 

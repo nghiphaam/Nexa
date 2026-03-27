@@ -83,7 +83,7 @@ def main():
         auto_select_device,
     )
 
-    args = apply_preset_args(args)
+    args = apply_preset_args(args, sys.argv[1:])
 
     # Device selection
     if args.device == "auto":
