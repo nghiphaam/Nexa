@@ -243,7 +243,7 @@ class NexaModel(nn.Module):
                 idx = idx.unsqueeze(0)
             elif idx.dim() != 2:
                 raise ValueError(f"inputs tensor must have shape (T,) or (B, T), got {tuple(idx.shape)}")
-            prompt_lengths = [idx.size(1)] * idx.size(0)
+            prompt_lengths = self._infer_prompt_lengths(idx)
             return idx, prompt_lengths
 
         if isinstance(inputs, str):
@@ -287,6 +287,78 @@ class NexaModel(nn.Module):
             prompt_lengths.append(len(row))
             idx[batch_idx, : len(row)] = torch.tensor(row, dtype=torch.long, device=device)
         return idx, prompt_lengths
+
+    def _infer_prompt_lengths(self, idx):
+        if idx.dim() != 2:
+            raise ValueError(f"idx must have shape (B, T), got {tuple(idx.shape)}")
+        pad_id = getattr(self.config, "pad_token_id", None)
+        if pad_id is None:
+            return [idx.size(1)] * idx.size(0)
+
+        prompt_lengths = []
+        for row in idx:
+            pad_positions = (row == int(pad_id)).nonzero(as_tuple=True)[0]
+            length = int(pad_positions[0].item()) if pad_positions.numel() > 0 else row.size(0)
+            if length <= 0:
+                raise ValueError("Cannot generate from empty or fully padded input row")
+            prompt_lengths.append(length)
+        return prompt_lengths
+
+    def _pad_token_rows(self, rows):
+        device = self.transformer.wte.weight.device
+        pad_id = getattr(self.config, "pad_token_id", None)
+        if pad_id is None:
+            pad_id = getattr(self.config, "eos_id", None)
+        if pad_id is None:
+            pad_id = 0
+
+        max_len = max((len(row) for row in rows), default=0)
+        padded = torch.full((len(rows), max_len), int(pad_id), dtype=torch.long, device=device)
+        for row_idx, row in enumerate(rows):
+            if not row:
+                continue
+            padded[row_idx, : len(row)] = torch.tensor(row, dtype=torch.long, device=device)
+        return padded
+
+    def _merge_generation_outputs(self, sample_outputs, tokenizer=None, return_dict=False, include_prompt=True):
+        token_rows = []
+        generated_rows = []
+        prompt_lengths = []
+
+        for output in sample_outputs:
+            full_row = output.get("token_id_rows", [output["token_ids"][0].tolist()])[0]
+            generated_row = output["generated_token_ids"][0]
+            token_rows.append(full_row)
+            generated_rows.append(generated_row)
+            prompt_lengths.append(int(output["prompt_lengths"][0]))
+
+        padded = self._pad_token_rows(token_rows)
+        if not return_dict:
+            return padded
+
+        result = {
+            "token_ids": padded,
+            "generated_token_ids": generated_rows,
+            "prompt_lengths": prompt_lengths,
+        }
+        if include_prompt:
+            result["token_id_rows"] = token_rows
+        if tokenizer is not None:
+            result["generated_texts"] = tokenizer.decode_batch(generated_rows)
+            if include_prompt:
+                result["texts"] = tokenizer.decode_batch(token_rows)
+        return result
+
+    def _slice_batch_value(self, value, index, batch_size):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            if value.dim() > 0 and value.size(0) == batch_size:
+                return value[index : index + 1]
+            return value
+        if isinstance(value, (list, tuple)) and len(value) == batch_size:
+            return value[index]
+        return value
 
     def _build_generation_output(self, full_sequence, prompt_lengths, tokenizer=None, return_dict=False, include_prompt=True):
         if not return_dict:
@@ -440,6 +512,46 @@ class NexaModel(nn.Module):
             else bool(use_speculative)
         )
         use_speculative = use_speculative and draft_model is not None and batch_size == 1
+
+        has_prompt_padding = any(length != prompt_len for length in prompt_lengths)
+        if has_prompt_padding:
+            if batch_size > 1:
+                if caches is not None:
+                    raise ValueError("Explicit caches are not supported for variable-length batched generation")
+                sample_outputs = []
+                for batch_idx, prompt_length in enumerate(prompt_lengths):
+                    sample_outputs.append(
+                        self.generate(
+                            idx[batch_idx, :prompt_length].unsqueeze(0),
+                            max_new_tokens=max_new_tokens,
+                            temperature=temperature,
+                            top_k=top_k,
+                            top_p=top_p,
+                            min_p=min_p,
+                            repetition_penalty=repetition_penalty,
+                            caches=None,
+                            draft_model=draft_model,
+                            gamma=gamma,
+                            head=head,
+                            memory_state=self._slice_batch_value(memory_state, batch_idx, batch_size),
+                            memory_query_state=self._slice_batch_value(memory_query_state, batch_idx, batch_size),
+                            tokenizer=tokenizer,
+                            return_dict=True,
+                            include_prompt=include_prompt,
+                            use_speculative=use_speculative,
+                            eos_id=eos_id,
+                        )
+                    )
+                return self._merge_generation_outputs(
+                    sample_outputs,
+                    tokenizer=tokenizer,
+                    return_dict=return_dict,
+                    include_prompt=include_prompt,
+                )
+
+            idx = idx[:, :prompt_lengths[0]]
+            prompt_len = idx.size(1)
+            prompt_lengths = [prompt_len]
 
         original_draft_training = None
         if draft_model is not None:

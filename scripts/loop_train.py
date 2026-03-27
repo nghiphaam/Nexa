@@ -7,14 +7,17 @@ from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+REPO_ROOT = str(Path(__file__).parent.parent)
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 from nexa.inference.chat_session import ChatSession
 from nexa.inference.self_improve import batch_generate_and_score
 from nexa.model.config import Config
 from nexa.model.nexa_model import NexaModel
-from nexa.tokenizer.tokenizer import load_tokenizer
+from nexa.tokenizer.tokenizer import EOS_TOKEN, PAD_TOKEN, load_tokenizer
 from nexa.training.self_improve_dataset import append_jsonl, count_samples
+from nexa.utils.device import auto_select_device, get_xla_device, safe_cuda_alloc, safe_xla_alloc, sync_xla
 
 
 def _normalize_config(raw_config, device: str) -> Config:
@@ -34,6 +37,21 @@ def _normalize_config(raw_config, device: str) -> Config:
     return config
 
 
+def _resolve_device(requested_device: str) -> str:
+    if requested_device == 'auto':
+        return auto_select_device(prefer_cuda=True)
+    if requested_device == 'cuda':
+        if not safe_cuda_alloc(0):
+            raise RuntimeError('CUDA requested but not available')
+        return 'cuda:0'
+    if requested_device in ('xla', 'tpu'):
+        if not safe_xla_alloc():
+            raise RuntimeError('XLA/TPU requested but not available')
+        get_xla_device()
+        return 'xla'
+    return requested_device
+
+
 def load_model(checkpoint_path: str, device: str = 'cuda'):
     """Load model from checkpoint using the checkpoint's saved Config."""
     print(f"Loading model from {checkpoint_path}...")
@@ -41,6 +59,9 @@ def load_model(checkpoint_path: str, device: str = 'cuda'):
     ckpt = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
 
     config = _normalize_config(ckpt.get('config'), device)
+    tokenizer = load_tokenizer()
+    config.eos_id = tokenizer.token_to_id(EOS_TOKEN)
+    config.pad_token_id = tokenizer.token_to_id(PAD_TOKEN)
     model = NexaModel(config)
     missing, unexpected = model.load_state_dict(ckpt['model'], strict=False)
     if missing or unexpected:
@@ -82,7 +103,7 @@ def main():
     parser.add_argument('--output', default='data/self_improve.jsonl', help='Output dataset path')
     parser.add_argument('--prompts-file', default=None, help='File with prompts (one per line)')
     parser.add_argument('--min-score', type=float, default=0.7, help='Minimum quality score')
-    parser.add_argument('--device', default='cuda', help='Device (cuda/cpu/xla)')
+    parser.add_argument('--device', default='auto', help='Device (auto/cuda/cpu/xla)')
     parser.add_argument('--iterations', type=int, default=1, help='Number of loop iterations')
     parser.add_argument('--train-after-gen', action='store_true', help='Run training after generation')
     args = parser.parse_args()
@@ -100,7 +121,8 @@ def main():
         print(f"  ITERATION {iteration + 1}/{args.iterations}")
         print(f"{'=' * 65}")
 
-        model, config = load_model(args.checkpoint, args.device)
+        resolved_device = _resolve_device(args.device)
+        model, config = load_model(args.checkpoint, resolved_device)
         initial_count = count_samples(args.output)
         new_samples = generate_training_data(model, config, prompts, args.output, args.min_score)
         final_count = count_samples(args.output)
@@ -116,10 +138,9 @@ def main():
             break
 
         del model
-        if torch.cuda.is_available():
+        if resolved_device.startswith('cuda'):
             torch.cuda.empty_cache()
-        elif args.device.startswith('xla'):
-            from nexa.utils.device import sync_xla
+        elif resolved_device.startswith('xla'):
             sync_xla()
 
     print(f"\nDone. Self-improvement dataset: {args.output}")

@@ -7,6 +7,10 @@ import math
 class LoRALinear(nn.Module):
     def __init__(self, original_linear, rank=8, alpha=16, dropout=0.0):
         super().__init__()
+        if rank <= 0:
+            raise ValueError(f"rank must be positive, got {rank}")
+        if alpha <= 0:
+            raise ValueError(f"alpha must be positive, got {alpha}")
         self.original = original_linear
         self.rank = rank
         self.alpha = alpha
@@ -35,6 +39,10 @@ class LoRALinear(nn.Module):
 
 def apply_lora(model, rank=8, alpha=16, dropout=0.0, target_modules=None):
     """Apply LoRA to model's linear layers."""
+    if rank <= 0:
+        raise ValueError(f"rank must be positive, got {rank}")
+    if alpha <= 0:
+        raise ValueError(f"alpha must be positive, got {alpha}")
     if target_modules is None:
         target_modules = ["wq", "wk", "wv", "c_proj", "w1", "w2", "w3"]
 
@@ -43,6 +51,8 @@ def apply_lora(model, rank=8, alpha=16, dropout=0.0, target_modules=None):
         for attr_name in target_modules:
             if hasattr(module, attr_name):
                 original = getattr(module, attr_name)
+                if isinstance(original, LoRALinear):
+                    continue
                 if isinstance(original, nn.Linear):
                     lora_layer = LoRALinear(original, rank=rank, alpha=alpha, dropout=dropout)
                     setattr(module, attr_name, lora_layer)
@@ -60,21 +70,22 @@ def apply_lora(model, rank=8, alpha=16, dropout=0.0, target_modules=None):
     return model
 
 
+def _merge_lora_modules(module):
+    count = 0
+    for attr_name, child in list(module.named_children()):
+        if isinstance(child, LoRALinear):
+            with torch.no_grad():
+                merge_weight = child.lora_B @ child.lora_A * child.scaling
+                child.original.weight.add_(merge_weight.to(child.original.weight.dtype))
+            setattr(module, attr_name, child.original)
+            count += 1
+            continue
+        count += _merge_lora_modules(child)
+    return count
+
+
 def merge_lora(model):
     """Merge LoRA weights back into base model."""
-    count = 0
-    for name, module in model.named_modules():
-        for attr_name in list(dir(module)):
-            try:
-                sub = getattr(module, attr_name)
-            except Exception:
-                continue
-            if isinstance(sub, LoRALinear):
-                with torch.no_grad():
-                    merge_weight = sub.lora_B @ sub.lora_A * sub.scaling
-                    sub.original.weight.add_(merge_weight.to(sub.original.weight.dtype))
-                setattr(module, attr_name, sub.original)
-                count += 1
-
+    count = _merge_lora_modules(model)
     print(f"LoRA merged: {count} layers")
     return model
