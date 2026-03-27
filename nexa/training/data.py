@@ -4,7 +4,7 @@ import os
 import numpy as np
 import torch
 
-from nexa.utils.device import is_cuda_device, is_xla_device
+from nexa.utils.device import get_rank, get_world_size, is_cuda_device, is_distributed, is_xla_device
 
 
 def resolve_token_dtype(vocab_size=None, token_dtype=None):
@@ -52,6 +52,8 @@ class DataLoaderLite:
         self.block_size = block_size
         self.data_path = data_path
         self.token_dtype = resolve_token_dtype(vocab_size=vocab_size, token_dtype=token_dtype)
+        self.sampler = None
+        self._epoch = 0
 
         if is_xla_device(device):
             self.data = np.memmap(data_path, dtype=self.token_dtype, mode='r')
@@ -65,19 +67,41 @@ class DataLoaderLite:
             self.iter = None
         else:
             self.dataset = ChunkDataset(data_path, block_size, token_dtype=self.token_dtype)
+            if len(self.dataset) == 0:
+                bytes_size = os.path.getsize(data_path)
+                num_tokens = bytes_size // np.dtype(self.token_dtype).itemsize
+                raise ValueError(
+                    f"Dataset {data_path} is too small for block_size={block_size}: got {num_tokens} tokens"
+                )
+
             n_w = min(4, os.cpu_count() or 1) if is_cuda_device(device) else 0
+            if is_cuda_device(device) and is_distributed():
+                self.sampler = torch.utils.data.distributed.DistributedSampler(
+                    self.dataset,
+                    num_replicas=get_world_size(),
+                    rank=get_rank(),
+                    shuffle=True,
+                    drop_last=True,
+                )
             self.loader = torch.utils.data.DataLoader(
                 self.dataset,
                 batch_size=batch_size,
-                shuffle=True,
+                shuffle=self.sampler is None,
+                sampler=self.sampler,
                 drop_last=True,
                 num_workers=n_w,
                 pin_memory=is_cuda_device(device),
                 persistent_workers=(n_w > 0 and is_cuda_device(device)),
                 prefetch_factor=2 if n_w > 0 else None,
             )
-            self.iter = iter(self.loader)
+            self.iter = self.new_iter()
             self.data = None
+
+    def new_iter(self):
+        if self.sampler is not None:
+            self.sampler.set_epoch(self._epoch)
+            self._epoch += 1
+        return iter(self.loader)
 
 
 class CUDAPrefetcher:
@@ -124,7 +148,7 @@ class CUDAPrefetcher:
         try:
             chunk = next(self.iter)
         except StopIteration:
-            self.iter = iter(self.loader)
+            self.iter = self.base_loader.new_iter()
             chunk = next(self.iter)
 
         x = chunk[:, :-1].contiguous()

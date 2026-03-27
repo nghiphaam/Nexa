@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from nexa.model.config import Config
 from nexa.model.nexa_model import NexaModel
-from nexa.tokenizer.tokenizer import load_tokenizer, EOS_TOKEN
+from nexa.tokenizer.tokenizer import load_tokenizer, EOS_TOKEN, PAD_TOKEN
 from nexa.utils.device import (
     is_cuda_device,
     is_xla_device,
@@ -61,6 +61,7 @@ def train(config: Config):
     tokenizer = load_tokenizer()
     config.vocab_size = tokenizer.get_vocab_size()
     config.eos_id = tokenizer.token_to_id(EOS_TOKEN)
+    config.pad_token_id = tokenizer.token_to_id(PAD_TOKEN)
 
     if is_main_process:
         print("=" * 65)

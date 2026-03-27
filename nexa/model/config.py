@@ -10,7 +10,7 @@ class Config:
     # Model core
     vocab_size: int = 50261
     eos_id: int | None = None
-    pad_token_id: int | None = 0
+    pad_token_id: int | None = 50257
     block_size: int = 2048
     sliding_window: int | None = 2048
     n_embd: int = 2048

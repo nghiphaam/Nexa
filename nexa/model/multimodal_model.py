@@ -196,6 +196,17 @@ class MultimodalModel(nn.Module):
             padded.append(emb)
         return torch.stack(padded, dim=0), gate_alpha
 
+    def _slice_images(self, images, index, batch_size):
+        if images is None:
+            return None
+        if torch.is_tensor(images):
+            if images.dim() > 0 and images.size(0) == batch_size:
+                return images[index : index + 1]
+            return images
+        if isinstance(images, (list, tuple)) and len(images) == batch_size:
+            return images[index]
+        return images
+
     @torch.no_grad()
     def generate(self, input_ids, images=None, max_new_tokens=None, **kwargs):
         """Generate tokens or text with optional images.
@@ -217,6 +228,35 @@ class MultimodalModel(nn.Module):
         max_new_tokens = int(max_new_tokens or getattr(self.config, "gen_len", 200))
 
         token_history, prompt_lengths = self.text_model._prepare_generation_inputs(input_ids, tokenizer=tokenizer)
+        if token_history.size(0) > 1:
+            sample_outputs = []
+            for batch_idx, prompt_length in enumerate(prompt_lengths):
+                sample_outputs.append(
+                    self.generate(
+                        token_history[batch_idx, :prompt_length].unsqueeze(0),
+                        images=self._slice_images(images, batch_idx, token_history.size(0)),
+                        max_new_tokens=max_new_tokens,
+                        tokenizer=tokenizer,
+                        return_dict=True,
+                        include_prompt=include_prompt,
+                        temperature=temperature,
+                        top_k=top_k,
+                        top_p=top_p,
+                        min_p=min_p,
+                        repetition_penalty=repetition_penalty,
+                        eos_id=eos_id,
+                    )
+                )
+            return self.text_model._merge_generation_outputs(
+                sample_outputs,
+                tokenizer=tokenizer,
+                return_dict=return_dict,
+                include_prompt=include_prompt,
+            )
+
+        if prompt_lengths[0] != token_history.size(1):
+            token_history = token_history[:, :prompt_lengths[0]]
+
         prompt_embeddings, _ = self._build_generation_embeddings(token_history, images)
         batch_size = token_history.size(0)
         finished = torch.zeros(batch_size, dtype=torch.bool, device=token_history.device)

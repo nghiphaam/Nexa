@@ -8,12 +8,15 @@ from dataclasses import asdict, fields, is_dataclass
 
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 from nexa.inference.lora import LoRALinear, apply_lora
 from nexa.model.config import Config
 from nexa.model.nexa_model import NexaModel
-from nexa.tokenizer.tokenizer import EOS_TOKEN, load_tokenizer
+from nexa.tokenizer.tokenizer import EOS_TOKEN, PAD_TOKEN, load_tokenizer
+from nexa.utils.device import auto_select_device, get_xla_device, safe_cuda_alloc, safe_xla_alloc
 
 
 def normalize_config(raw_config) -> Config:
@@ -60,6 +63,21 @@ def build_autoregressive_batch(token_rows, pad_id, device):
     return input_ids, labels
 
 
+def resolve_device(requested_device: str) -> str:
+    if requested_device == "auto":
+        return auto_select_device(prefer_cuda=True)
+    if requested_device == "cuda":
+        if not safe_cuda_alloc(0):
+            raise RuntimeError("CUDA requested but not available")
+        return "cuda:0"
+    if requested_device in ("xla", "tpu"):
+        if not safe_xla_alloc():
+            raise RuntimeError("XLA/TPU requested but not available")
+        get_xla_device()
+        return "xla"
+    return requested_device
+
+
 def load_sft_data(data_path):
     data = []
     with open(data_path, 'r', encoding='utf-8') as f:
@@ -93,10 +111,7 @@ def main():
     p.add_argument('--target-modules', nargs='*', default=None, help='Optional override for LoRA target module attribute names')
     args = p.parse_args()
 
-    if args.device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    else:
-        device = args.device
+    device = resolve_device(args.device)
 
     print(f"Loading checkpoint: {args.checkpoint}")
     ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
@@ -106,6 +121,7 @@ def main():
     tokenizer = load_tokenizer()
     config.vocab_size = tokenizer.get_vocab_size()
     config.eos_id = tokenizer.token_to_id(EOS_TOKEN)
+    config.pad_token_id = tokenizer.token_to_id(PAD_TOKEN)
 
     model = NexaModel(config)
     missing, unexpected = model.load_state_dict(ckpt['model'], strict=False)
@@ -147,7 +163,7 @@ def main():
                     ids = ids[:config.block_size]
                 token_rows.append(ids)
 
-            input_ids, labels = build_autoregressive_batch(token_rows, config.eos_id, device)
+            input_ids, labels = build_autoregressive_batch(token_rows, config.pad_token_id, device)
 
             _, loss = model(input_ids, labels)
             optimizer.zero_grad(set_to_none=True)
