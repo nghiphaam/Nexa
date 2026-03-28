@@ -65,3 +65,4 @@ temp/
 # Etc
 # -------------------
 .claude
+.codex
