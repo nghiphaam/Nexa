@@ -118,7 +118,7 @@ _cached_tokenizer: dict[str, NexaTokenizer] = {}
 def load_tokenizer() -> NexaTokenizer:
     global _cached_tokenizer
     if "nexa" not in _cached_tokenizer:
-        print("Tokenizer: Nexa 1.6 BPE (vocab=50,261)")
+        print("Tokenizer: Nexa BPE (vocab=50,261)")
         _cached_tokenizer["nexa"] = NexaTokenizer()
     return _cached_tokenizer["nexa"]
 

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nexa"
-version = "1.6.0"
-description = "Nexa 1.6 language and multimodal model stack"
+version = "2.0.0"
+description = "Nexa causal language model core"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
@@ -14,14 +14,7 @@ authors = [
 ]
 dependencies = [
     "torch>=2.2.0",
-    "numpy>=1.24.0",
-    "tokenizers>=0.20.0",
-    "datasets>=2.14.0",
-    "tqdm>=4.66.0",
     "tiktoken>=0.8.0",
-    "tensorboard>=2.16.0",
-    "transformers>=4.45.0",
-    "Pillow>=10.4.0",
 ]
 
 [project.optional-dependencies]
@@ -30,9 +23,6 @@ dev = [
     "black>=23.0.0",
     "flake8>=6.1.0",
     "mypy>=1.8.0",
-]
-tpu = [
-    "torch_xla>=2.2.0",
 ]
 
 [project.urls]

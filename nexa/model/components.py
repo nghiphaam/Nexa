@@ -1,4 +1,4 @@
-"""Model components: RMSNorm, RoPE, KVCache, FeedForward, TransformerBlock."""
+"""Core model building blocks."""
 import math
 import torch
 import torch.nn as nn
@@ -13,7 +13,7 @@ class RMSNorm(nn.Module):
 
     def forward(self, x):
         variance = x.float().pow(2).mean(-1, keepdim=True)
-        # Clamp variance to prevent NaN in rsqrt
+
         norm = torch.rsqrt(variance.clamp(min=self.eps))
         return (x.float() * norm).type_as(x) * self.weight
 
@@ -26,7 +26,6 @@ def precompute_rope_freqs(dim, max_seq_len, theta=10000.0):
 
 
 def apply_rope(xq, xk, freqs_cos, freqs_sin):
-    # FIX #7: Handle shape mismatch gracefully
     seq_len = xq.shape[-2]
     freq_len = freqs_cos.shape[0]
     if seq_len != freq_len:
